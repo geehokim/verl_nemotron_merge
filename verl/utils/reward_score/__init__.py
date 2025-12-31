@@ -56,10 +56,16 @@ def default_compute_score(
 
         # from . import math_verify
         # res = math_verify.compute_score(solution_str, ground_truth)
-    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"] or data_source.startswith("aime"):
+    elif data_source in ["math_dapo", "math", "math_dapo_reasoning"]:
         from . import math_dapo
 
         res = math_dapo.compute_score(solution_str, ground_truth)
+    elif data_source in ["aime25", "aime24", "aime"] or data_source.startswith("aime"):
+        # Use AIME-specific reward function adapted from Nemotron-Cascade evaluation
+        from . import aime
+
+        res = aime.compute_score(solution_str, ground_truth)
+
     elif data_source in [
         "numina_aops_forum",
         "numina_synthetic_math",
