@@ -327,7 +327,7 @@ def compute_score(
             return {
                 "score": 0.0,
                 "acc": False,
-                "pred": None,
+                "pred": "",
                 "extraction_failed": True,
             }
         return 0.0
@@ -363,7 +363,8 @@ def compute_score(
         return {
             "score": reward,
             "acc": is_correct,
-            "pred": extracted_answer_cleaned,
+            "pred": extracted_answer_cleaned if extracted_answer_cleaned else "",
+            "extraction_failed": False,
         }
     return reward
 

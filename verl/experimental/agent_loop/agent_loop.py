@@ -47,6 +47,9 @@ from verl.utils.rollout_trace import (
 from verl.utils.transferqueue_utils import tqbridge
 from verl.workers.rollout.replica import TokenOutput, get_rollout_replica_class
 
+import warnings
+warnings.filterwarnings("ignore", message=".*TokenizerFast.*")
+
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
@@ -366,16 +369,37 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
+        # tasks = []
+        # for i in range(len(batch)):
+        #     trace_this_sample = i in traced_indices
+        #     kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+        #     tasks.append(
+        #         asyncio.create_task(
+        #             self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+        #         )
+        #     )
+        # outputs = await asyncio.gather(*tasks)
+
+        from tqdm.asyncio import tqdm_asyncio
+        import time
+
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(
-                asyncio.create_task(
-                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-                )
+                self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
             )
-        outputs = await asyncio.gather(*tasks)
+
+        is_validate = batch.meta_info.get("validate", False)
+        step = batch.meta_info.get("global_steps", -1)
+        desc = f"[Step {step}] {'Val' if is_validate else 'Train'} Rollout"
+
+        start_time = time.time()
+        outputs = await tqdm_asyncio.gather(*tasks, desc=desc, total=len(tasks))
+        elapsed = time.time() - start_time
+
+        logger.info(f"{desc} completed: {len(tasks)} samples in {elapsed:.1f}s ({len(tasks)/elapsed:.1f} samples/s)")
 
         output = self._postprocess(outputs)
 
@@ -436,6 +460,9 @@ class AgentLoopWorkerBase:
         #   e.g., [1,1,1,1,1,1,1,(tool start),0,0(tool end),1,1,0,0,0,0]
         # - position_ids: sequential positions for tokens, starting at 0
         #   e.g., [0,0,0,0,0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,0,0,0,0]
+
+        import warnings
+        warnings.filterwarnings("ignore", category=UserWarning, module="transformers")
 
         self.tokenizer.padding_side = "left"
         prompt_output = self.tokenizer.pad(
