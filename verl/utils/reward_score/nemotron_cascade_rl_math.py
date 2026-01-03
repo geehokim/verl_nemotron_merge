@@ -353,58 +353,65 @@ def compute_score(
         - answer_reward: 1.0 (correct) or 0.0 (incorrect/extraction failed)
         - code_switching_penalty: 0.0 (no code-switching) or -1.0 (code-switching detected)
     
-    Result Examples:
-        - Correct + No code-switching: 1.0 + 0.0 = 1.0
-        - Correct + Code-switching:    1.0 + (-1.0) = 0.0
-        - Incorrect + No code-switching: 0.0 + 0.0 = 0.0
-        - Incorrect + Code-switching:    0.0 + (-1.0) = -1.0
-    
-    The function:
-    1. Detects code-switching to compute penalty
-    2. Extracts \boxed{} answer after </think> token
-    3. Verifies answer using 3-stage verification
-    4. Returns sum of answer_reward and code_switching_penalty
+    Overlong Filtering (Stage 1):
+        When overlong_filtering=True and response exceeds max_response_length,
+        the sample is marked with skip=True and won't contribute to the policy gradient.
     
     Args:
         solution_str: Model's full output string (reasoning + answer)
         ground_truth: Ground truth answer string
         extra_info: Optional dict containing:
             - "language": Prompt language code (default: "en")
-            - Other metadata (ignored)
-        return_dict: If True, return dict with score and metadata;
-                     If False, return float score only
+            - "overlong_filtering": Whether to filter overlong responses
+            - "response_length": Actual response length in tokens
+            - "max_response_length": Maximum allowed response length
+        return_dict: If True, return dict with score and metadata
     
     Returns:
         If return_dict=True:
-            dict: {
-                "score": float (answer_reward + code_switching_penalty),
-                "acc": bool (whether answer is correct),
-                "pred": str (extracted answer or empty string),
-                "code_switching": bool (whether code-switching detected),
-                "extraction_failed": bool (whether answer extraction failed),
-                "answer_reward": float (1.0 or 0.0),
-                "code_switching_penalty": float (0.0 or -1.0)
-            }
+            dict with score, acc, pred, skip, overlong, etc.
         If return_dict=False:
-            float: Total reward score (answer_reward + code_switching_penalty)
-    
-    Example:
-        >>> compute_score("<think>...</think>\\boxed{42}", "42")
-        {"score": 1.0, "acc": True, "pred": "42", ...}  # 1.0 + 0.0 = 1.0
-        
-        >>> compute_score("Let me 计算一下...</think>\\boxed{42}", "42", {"language": "en"})
-        {"score": 0.0, "acc": True, "pred": "42", "code_switching": True, ...}  # 1.0 + (-1.0) = 0.0
+            float: Total reward score
     """
     # ==========================================================================
-    # Step 0: Parse extra_info for prompt language
+    # Step 0: Parse extra_info
     # ==========================================================================
     
-    prompt_language = "en"  # Default to English
+    prompt_language = "en"
+    overlong_filtering = False
+    response_length = 0
+    max_response_length = float("inf")
+    
     if extra_info and isinstance(extra_info, dict):
-        # Support multiple possible keys for language
         prompt_language = extra_info.get("language", 
                          extra_info.get("lang",
                          extra_info.get("prompt_language", "en")))
+        overlong_filtering = extra_info.get("overlong_filtering", False)
+        response_length = extra_info.get("response_length", 0)
+        max_response_length = extra_info.get("max_response_length", float("inf"))
+    
+    # ==========================================================================
+    # Step 0.5: Check for overlong filtering (Stage 1 only)
+    # ==========================================================================
+    
+    # Response is overlong if it reached exactly max_response_length (truncated by vLLM)
+    is_overlong = (response_length >= max_response_length) if max_response_length != float("inf") else False
+    
+    if overlong_filtering and is_overlong:
+        # Return skip marker - these samples won't contribute to policy gradient
+        if return_dict:
+            return {
+                "score": 0.0,
+                "acc": None,
+                "pred": "",
+                "code_switching": False,
+                "extraction_failed": False,
+                "answer_reward": 0.0,
+                "code_switching_penalty": 0.0,
+                "skip": True,
+                "overlong": True,
+            }
+        return 0.0
     
     # ==========================================================================
     # Step 1: Detect code-switching to compute penalty
@@ -452,6 +459,8 @@ def compute_score(
             "extraction_failed": extraction_failed,
             "answer_reward": answer_reward,
             "code_switching_penalty": code_switching_penalty,
+            "skip": False,
+            "overlong": is_overlong,
         }
     return total_reward
 

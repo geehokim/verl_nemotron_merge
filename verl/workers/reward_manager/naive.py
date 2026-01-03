@@ -27,7 +27,15 @@ from verl.workers.reward_manager.abstract import AbstractRewardManager
 class NaiveRewardManager(AbstractRewardManager):
     """The reward manager."""
 
-    def __init__(self, tokenizer, num_examine, compute_score=None, reward_fn_key="data_source") -> None:
+    def __init__(
+        self,
+        tokenizer,
+        num_examine,
+        compute_score=None,
+        reward_fn_key="data_source",
+        overlong_filtering: bool = False,
+        **kwargs,
+    ) -> None:
         """
         Initialize the NaiveRewardManager instance.
 
@@ -37,11 +45,14 @@ class NaiveRewardManager(AbstractRewardManager):
             compute_score: A function to compute the reward score. If None, `default_compute_score` will be used.
             reward_fn_key: The key used to access the data source in the non-tensor batch data. Defaults to
                 "data_source".
+            overlong_filtering: Whether to filter overlong responses (for Nemotron-Cascade RL Math Stage 1).
         """
         self.tokenizer = tokenizer  # Store the tokenizer for decoding token IDs
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key  # Store the key for accessing the data source
+        # Nemotron-Cascade overlong filtering parameter
+        self.overlong_filtering = overlong_filtering
 
     def __call__(self, data: DataProto, return_dict: bool = False) -> torch.Tensor | dict[str, Any]:
         """We will expand this function gradually based on the available datasets"""
@@ -53,6 +64,10 @@ class NaiveRewardManager(AbstractRewardManager):
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_extra_info = defaultdict(list)
+
+        # Get max_response_length from batch (for overlong filtering)
+        # This is the rollout's max_new_tokens setting
+        max_response_length = data.batch["responses"].shape[-1]
 
         already_print_data_sources = {}
 
@@ -76,11 +91,18 @@ class NaiveRewardManager(AbstractRewardManager):
 
             ground_truth = data_item.non_tensor_batch["reward_model"]["ground_truth"]
             data_source = data_item.non_tensor_batch[self.reward_fn_key]
-            extra_info = data_item.non_tensor_batch.get("extra_info", {})
+            extra_info = data_item.non_tensor_batch.get("extra_info", {}) or {}
+            extra_info = dict(extra_info)  # Make a copy to avoid modifying original
             num_turns = data_item.non_tensor_batch.get("__num_turns__", None)
             rollout_reward_scores = data_item.non_tensor_batch.get("reward_scores", {})
             extra_info["num_turns"] = num_turns
             extra_info["rollout_reward_scores"] = rollout_reward_scores
+            # Add response_length for Nemotron-Cascade overlong filtering
+            extra_info["response_length"] = int(valid_response_length.item()) if torch.is_tensor(valid_response_length) else int(valid_response_length)
+            extra_info["overlong_filtering"] = self.overlong_filtering
+            extra_info["max_response_length"] = max_response_length
+            # Add index for curriculum sampler tracking
+            extra_info["index"] = data_item.non_tensor_batch.get("index", i)
 
             score = self.compute_score(
                 data_source=data_source,

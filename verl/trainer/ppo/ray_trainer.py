@@ -1518,6 +1518,28 @@ class RayPPOTrainer:
                             config=self.config.algorithm,
                         )
 
+                        # =====================================================================
+                        # Nemotron-Cascade Overlong Filtering
+                        # skip==True인 샘플의 advantage를 0으로 설정하여 policy gradient에 기여하지 않게 함
+                        # Note: skip된 샘플의 reward는 여전히 GRPO mean/std 계산에 포함됨
+                        # =====================================================================
+                        if "skip" in batch.non_tensor_batch:
+                            skip_flags = batch.non_tensor_batch["skip"]
+                            if not isinstance(skip_flags, np.ndarray):
+                                skip_flags = np.array(skip_flags)
+                            skip_mask = torch.tensor(
+                                skip_flags, dtype=torch.bool, device=batch.batch["advantages"].device
+                            )
+                            
+                            if skip_mask.any():
+                                # skip된 샘플의 advantage/returns를 0으로 설정
+                                batch.batch["advantages"][skip_mask] = 0.0
+                                batch.batch["returns"][skip_mask] = 0.0
+                                
+                                skipped_count = skip_mask.sum().item()
+                                metrics["nemotron_cascade/skipped_overlong_samples"] = skipped_count
+                                metrics["nemotron_cascade/skip_ratio"] = skipped_count / len(skip_mask)
+
                     # update critic
                     if self.use_critic:
                         with marked_timer("update_critic", timing_raw, color="pink"):
