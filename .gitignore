@@ -129,3 +129,11 @@ logs
 log
 outputs
 .history
+
+# Core dump files
+core
+core.*
+*.core
+
+# Cursor IDE
+.cursor/
