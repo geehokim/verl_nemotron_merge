@@ -52,6 +52,12 @@ def default_compute_score(
 
         # Pass extra_info to support code-switching detection with prompt language
         res = nemotron_cascade_rl_math.compute_score(solution_str, ground_truth, extra_info=extra_info)
+
+    elif data_source == "nemotron_cascade_rl_swe":
+        from . import nemotron_cascade_rl_swe
+
+        # Pass extra_info for SWE-specific metadata (original_code, problem_id, etc.)
+        res = nemotron_cascade_rl_swe.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 
