@@ -21,6 +21,7 @@ import logging
 import os
 
 import torch
+from tqdm import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.tensor import DTensor
@@ -437,6 +438,12 @@ class DataParallelPPOActor(BasePPOActor):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
                     micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    # [DEBUG] Log dynamic batch split info to wandb (only first mini_batch)
+                    if batch_idx == 0:
+                        _samples_per_mb = [mb.batch["input_ids"].shape[0] for mb in micro_batches]
+                        metrics["debug/num_micro_batches"] = len(micro_batches)
+                        metrics["debug/max_samples_per_micro_batch"] = max(_samples_per_mb) if _samples_per_mb else 0
+                        metrics["debug/avg_samples_per_micro_batch"] = sum(_samples_per_mb) / len(_samples_per_mb) if _samples_per_mb else 0
                 else:
                     self.gradient_accumulation = (
                         self.config.ppo_mini_batch_size // self.config.ppo_micro_batch_size_per_gpu
@@ -445,7 +452,19 @@ class DataParallelPPOActor(BasePPOActor):
 
                 self.actor_optimizer.zero_grad()
 
-                for micro_batch in micro_batches:
+                # Add tqdm progress bar for gradient accumulation steps (only on rank 0)
+                # This helps monitor the progress of each mini-batch update
+                is_rank_zero = torch.distributed.get_rank() == 0
+                micro_batch_iterator = tqdm(
+                    enumerate(micro_batches),
+                    total=len(micro_batches),
+                    desc=f"  Grad Accum (epoch {_+1}, batch {batch_idx+1})",
+                    leave=False,
+                    disable=not is_rank_zero,  # Only show progress bar on rank 0
+                    ncols=100,
+                )
+
+                for micro_idx, micro_batch in micro_batch_iterator:
                     micro_batch = micro_batch.to(get_device_id())
                     micro_batch_metrics = {}
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -545,6 +564,13 @@ class DataParallelPPOActor(BasePPOActor):
 
                     micro_batch_metrics["actor/pg_loss"] = pg_loss.detach().item() * loss_scale_factor
                     append_to_dict(metrics, micro_batch_metrics)
+
+                    # Update tqdm progress bar with current loss info
+                    if is_rank_zero:
+                        micro_batch_iterator.set_postfix({
+                            "loss": f"{loss.detach().item():.4f}",
+                            "pg_loss": f"{pg_loss.detach().item():.4f}",
+                        })
 
                 grad_norm = self._optimizer_step()
                 mini_batch_metrics = {"actor/grad_norm": grad_norm.detach().item()}
