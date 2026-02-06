@@ -306,8 +306,16 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
 
         # note that we have to create model in fp32. Otherwise, the optimizer is in bf16, which is incorrect
         # TODO(zhangchi.usc1992): 1. support create from random initialized model. 2. Support init with FSDP directly
-        self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        try:
+            self.tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+            self.processor = hf_processor(local_path, trust_remote_code=trust_remote_code)
+        except Exception:
+            hf_subdir = os.path.join(local_path, "huggingface")
+            if not os.path.isdir(hf_subdir):
+                raise
+            print(f"Tokenizer not found at {local_path}, retrying from {hf_subdir}")
+            self.tokenizer = hf_tokenizer(hf_subdir, trust_remote_code=trust_remote_code)
+            self.processor = hf_processor(hf_subdir, trust_remote_code=trust_remote_code)
 
         if self.config.model.get("custom_chat_template", None) is not None:
             if self.processor is not None:
@@ -946,6 +954,7 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
         with simple_timer("generate_sequences", timing_generate):
             output = self.rollout.generate_sequences(prompts=prompts)
 
+        
         if self._is_actor:
             loop.run_until_complete(self.trainer_mode())
             log_gpu_memory_usage("After switch to trainer mode", logger=logger)

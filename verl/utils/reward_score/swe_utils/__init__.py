@@ -17,16 +17,15 @@
 SWE Utils Package
 
 This package provides utility functions for SWE RL (Software Engineering
-Reinforcement Learning) reward computation as described in the Nemotron-Cascade
-paper Section 4.7.
+Reinforcement Learning) reward computation.
 
 Modules:
     - patch_parser: Unified diff patch parsing and validation
     - lexical_similarity: Lexical similarity computation between patches
+    - search_replace: Search/Replace block parsing (SWE-RL format)
 
 Reference:
-    Nemotron-Cascade: Scaling Cascaded Reinforcement Learning for
-    General-Purpose Reasoning Models (Section 4.7 - SWE RL)
+    SWE-RL: Advancing LLM Reasoning via Reinforcement Learning on Open Software Engineering Tasks
 """
 
 from .patch_parser import (
@@ -34,6 +33,7 @@ from .patch_parser import (
     validate_patch,
     is_empty_patch,
     normalize_patch,
+    extract_patch_from_response,
 )
 from .lexical_similarity import compute_lexical_similarity
 
@@ -43,4 +43,5 @@ __all__ = [
     "is_empty_patch",
     "normalize_patch",
     "compute_lexical_similarity",
+    "extract_patch_from_response",
 ]

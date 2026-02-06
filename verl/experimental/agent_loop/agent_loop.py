@@ -369,37 +369,16 @@ class AgentLoopWorkerBase:
             batch.meta_info.get("global_steps", -1), index.tolist(), batch.meta_info.get("validate", False)
         )
 
-        # tasks = []
-        # for i in range(len(batch)):
-        #     trace_this_sample = i in traced_indices
-        #     kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
-        #     tasks.append(
-        #         asyncio.create_task(
-        #             self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
-        #         )
-        #     )
-        # outputs = await asyncio.gather(*tasks)
-
-        from tqdm.asyncio import tqdm_asyncio
-        import time
-
         tasks = []
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
             tasks.append(
-                self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                asyncio.create_task(
+                    self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
+                )
             )
-
-        is_validate = batch.meta_info.get("validate", False)
-        step = batch.meta_info.get("global_steps", -1)
-        desc = f"[Step {step}] {'Val' if is_validate else 'Train'} Rollout"
-
-        start_time = time.time()
-        outputs = await tqdm_asyncio.gather(*tasks, desc=desc, total=len(tasks))
-        elapsed = time.time() - start_time
-
-        logger.info(f"{desc} completed: {len(tasks)} samples in {elapsed:.1f}s ({len(tasks)/elapsed:.1f} samples/s)")
+        outputs = await asyncio.gather(*tasks)
 
         output = self._postprocess(outputs)
 
@@ -838,12 +817,41 @@ class AgentLoopManager:
             self.reward_model_manager.wake_up()
 
         chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = ray.get(
-            [
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
+        # outputs = ray.get(
+        #     [
+        #         worker.generate_sequences.remote(chunk)
+        #         for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+        #     ]
+        # )
+        # breakpoint()
+        refs = []
+        for idx, (worker, chunk) in enumerate(zip(self.agent_loop_workers, chunkes, strict=True)):
+            logger.warning(
+                "agent_loop dispatch: idx=%d worker=%s chunk_size=%d",
+                idx,
+                worker,
+                len(chunk),
+            )
+            refs.append(worker.generate_sequences.remote(chunk))
+        timeout_s = os.getenv("VERL_AGENT_LOOP_GET_TIMEOUT_S")
+        if timeout_s:
+            timeout = float(timeout_s)
+            try:
+                outputs = ray.get(refs, timeout=timeout)
+            except ray.exceptions.GetTimeoutError:
+                ready, pending = ray.wait(refs, timeout=0)
+                logger.error(
+                    "agent_loop ray.get timeout after %ss (ready=%d pending=%d)",
+                    timeout,
+                    len(ready),
+                    len(pending),
+                )
+                for pref in pending:
+                    logger.error("agent_loop pending ref=%s", pref)
+                raise
+        else:
+            outputs = ray.get(refs)
+        
         output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()

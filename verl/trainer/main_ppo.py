@@ -31,7 +31,6 @@ from verl.utils.config import validate_config
 from verl.utils.device import auto_set_ascend_device_name, is_cuda_available
 from verl.utils.import_utils import load_extern_object
 
-
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
 def main(config):
     """Main entry point for PPO training with Hydra configuration management.
@@ -305,9 +304,22 @@ class TaskRunner:
         from verl.utils import hf_processor, hf_tokenizer
 
         trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
-        # Used for multimodal LLM, could be None
-        processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        # tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+        # # Used for multimodal LLM, could be None
+        # processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+
+        try:
+            tokenizer = hf_tokenizer(local_path, trust_remote_code=trust_remote_code)
+            # Used for multimodal LLM, could be None
+            processor = hf_processor(local_path, trust_remote_code=trust_remote_code, use_fast=True)
+        except Exception:
+            hf_subdir = os.path.join(local_path, "huggingface")
+            if not os.path.isdir(hf_subdir):
+                raise
+            print(f"Tokenizer not found at {local_path}, retrying from {hf_subdir}")
+            tokenizer = hf_tokenizer(hf_subdir, trust_remote_code=trust_remote_code)
+            # Used for multimodal LLM, could be None
+            processor = hf_processor(hf_subdir, trust_remote_code=trust_remote_code, use_fast=True)
 
         # Load the reward manager for training and validation.
         reward_fn = load_reward_manager(

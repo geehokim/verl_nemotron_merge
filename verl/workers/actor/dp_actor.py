@@ -433,11 +433,11 @@ class DataParallelPPOActor(BasePPOActor):
         on_policy = len(mini_batches) == 1 and self.config.ppo_epochs == 1
 
         metrics = {}
-        for _ in range(self.config.ppo_epochs):
+        for epoch_idx in range(self.config.ppo_epochs):
             for batch_idx, mini_batch in enumerate(mini_batches):
                 if self.config.use_dynamic_bsz:
                     max_token_len = self.config.ppo_max_token_len_per_gpu * self.ulysses_sequence_parallel_size
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
+                    micro_batches, _batch_idx_list = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
                     # [DEBUG] Log dynamic batch split info to wandb (only first mini_batch)
                     if batch_idx == 0:
                         _samples_per_mb = [mb.batch["input_ids"].shape[0] for mb in micro_batches]
@@ -458,7 +458,7 @@ class DataParallelPPOActor(BasePPOActor):
                 micro_batch_iterator = tqdm(
                     enumerate(micro_batches),
                     total=len(micro_batches),
-                    desc=f"  Grad Accum (epoch {_+1}, batch {batch_idx+1})",
+                    desc=f"  Grad Accum (epoch {epoch_idx+1}, batch {batch_idx+1})",
                     leave=False,
                     disable=not is_rank_zero,  # Only show progress bar on rank 0
                     ncols=100,

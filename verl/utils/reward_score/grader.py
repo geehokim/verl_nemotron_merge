@@ -42,7 +42,7 @@ except ImportError:
     try:
         # Try alternative import path
         import sys
-        sys.path.insert(0, '/mnt/ddn/vuvlm/geeho/nemotron_evaluation/eval/tools')
+        sys.path.insert(0, './nemotron_evaluation/eval/tools')
         from latex2sympy.latex2sympy2 import latex2sympy
         LATEX2SYMPY_AVAILABLE = True
     except ImportError:
@@ -187,7 +187,8 @@ def symbolic_equal(a, b) -> bool:
 
     # simplify equal
     try:
-        if a.equals(b) or simplify(a - b) == 0:
+        # if a.equals(b) or simplify(a - b) == 0:
+        if a.equals(b):
             return True
     except:
         pass
@@ -200,8 +201,10 @@ def symbolic_equal(a, b) -> bool:
         pass
 
     # numeric equal after symbolic evaluation
+    # Note: Use limited precision (10 digits) to avoid hanging on complex expressions
+    # e.g., very large exponents like (10^10)^(10^10) can cause mpmath to hang
     try:
-        if numeric_equal(float(N(a)), float(N(b))):
+        if numeric_equal(float(N(a, 10)), float(N(b, 10))):
             return True
     except:
         pass
@@ -227,15 +230,24 @@ def symbolic_equal_process(a, b, output_queue):
 
 def call_with_timeout(func, *args, timeout=1, **kwargs):
     """Call a function with timeout protection using multiprocessing.
-    
+
+    This function protects against hanging computations (e.g., sympy evaluations that
+    take too long) by spawning a separate process and forcefully killing it if needed.
+
     Args:
         func: Function to call
         *args: Arguments to pass
-        timeout: Timeout in seconds
+        timeout: Timeout in seconds (default: 1 second)
         **kwargs: Keyword arguments
-    
+
     Returns:
         Function result or False if timeout
+
+    Implementation Notes:
+        - First tries process.terminate() (SIGTERM) for graceful shutdown
+        - If process doesn't die after 0.5s, uses process.kill() (SIGKILL) for forced termination
+        - This two-stage approach is necessary because C extension modules (like mpmath)
+          may not respond to SIGTERM immediately
     """
     output_queue = multiprocessing.Queue()
     process_args = args + (output_queue,)
@@ -244,8 +256,15 @@ def call_with_timeout(func, *args, timeout=1, **kwargs):
     process.join(timeout)
 
     if process.is_alive():
+        # Try graceful termination first
         process.terminate()
-        process.join()
+        process.join(timeout=0.5)  # Wait up to 0.5s for graceful shutdown
+
+        # If still alive, force kill (needed for C extensions stuck in tight loops)
+        if process.is_alive():
+            process.kill()
+            process.join()
+
         return False
 
     try:
@@ -259,7 +278,7 @@ def math_equal(
     reference: Union[float, str],
     include_percentage: bool = True,
     is_close: bool = True,
-    timeout: bool = False,
+    timeout: bool = True,
 ) -> bool:
     """
     Check if prediction equals reference mathematically.

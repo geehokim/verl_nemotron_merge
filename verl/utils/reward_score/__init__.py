@@ -54,10 +54,11 @@ def default_compute_score(
         res = nemotron_cascade_rl_math.compute_score(solution_str, ground_truth, extra_info=extra_info)
 
     elif data_source == "nemotron_cascade_rl_swe":
-        from . import nemotron_cascade_rl_swe
+        from . import swe_rl_reward
 
-        # Pass extra_info for SWE-specific metadata (original_code, problem_id, etc.)
-        res = nemotron_cascade_rl_swe.compute_score(solution_str, ground_truth, extra_info=extra_info)
+        # SEARCH/REPLACE format: requires code_context in extra_info
+        # ground_truth contains the golden patch (unified diff format)
+        res = swe_rl_reward.compute_score(solution_str, ground_truth, extra_info=extra_info)
     elif data_source in ["lighteval/MATH", "DigitalLearningGmbH/MATH-lighteval", "HuggingFaceH4/MATH-500"]:
         from . import math_reward
 

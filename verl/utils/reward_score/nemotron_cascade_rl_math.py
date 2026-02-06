@@ -181,42 +181,39 @@ def extract_boxed_after_think(solution_str: str) -> Optional[str]:
 
 def detect_code_switching(solution_str: str, prompt_language: str = "en") -> bool:
     """Detect code-switching in the reasoning chain using FastText.
-    
+
     This implements the Nemotron-Cascade paper's code-switching penalty:
     "we apply a code-switching penalty by assigning a reward of -1 whenever
     tokens from a language (e.g., Chinese) different from the original prompt's
     language (e.g., English) are detected in the reasoning chain."
-    
+
     Uses FastText language detection (ftlangdetect) which is the same approach
     used in NVIDIA's Nemotron implementations.
-    
+
     Args:
         solution_str: Model's full output string (reasoning + answer)
         prompt_language: Language code of the original prompt (e.g., "en", "zh", "ko")
                         Default is "en" (English)
-    
+
     Returns:
         True if code-switching is detected (different language found),
         False otherwise
-    
+
     Note:
         - If FastText is not available, returns False (no penalty applied)
         - Only checks the reasoning chain (text before </think>)
         - Requires: pip install fasttext-langdetect
-    
+
     Example:
         >>> detect_code_switching("Let me 计算一下...", "en")
         True  # Chinese detected in English prompt
         >>> detect_code_switching("Let me solve this problem...", "en")
         False  # Only English detected
     """
+    # TODO: Re-enable after fixing FastText hang issue
+    # Temporarily disabled to avoid hang during reward computation
     if not FASTTEXT_AVAILABLE:
-        # FastText is required for code-switching detection
-        # Raise error if not installed to ensure proper reward computation
-        raise ImportError(
-            "fasttext-langdetect is required for code-switching detection. "
-            "Please install it with: pip install fasttext-langdetect"
-        )
+        return False
     
     # Extract reasoning chain (text before </think> if exists)
     think_end_markers = ["</think>", "<\/think>", "</Think>"]
@@ -306,7 +303,7 @@ def verify_answer(extracted_answer: str, ground_truth: str) -> bool:
     # Method 1: math_equal (symbolic + numeric comparison)
     # This is the primary verification method from AceMath
     try:
-        if math_equal(extracted_cleaned, gt_cleaned):
+        if math_equal(extracted_cleaned, gt_cleaned, timeout=True):
             return True
     except Exception:
         # math_equal can fail on some malformed inputs
@@ -428,6 +425,7 @@ def compute_score(
     # From the paper: "extracting the boxed answer (\boxed{}) that follows
     # the </think> token"
     extracted_answer = extract_boxed_after_think(solution_str)
+
     
     extraction_failed = False
     if extracted_answer is None:
@@ -448,7 +446,11 @@ def compute_score(
     # ==========================================================================
     # Step 4: Compute total reward (answer_reward + code_switching_penalty)
     # ==========================================================================
-    total_reward = answer_reward + code_switching_penalty
+    # total_reward = answer_reward + code_switching_penalty
+    if has_code_switching:
+        total_reward = -1.0
+    else:
+        total_reward = answer_reward
     
     if return_dict:
         return {

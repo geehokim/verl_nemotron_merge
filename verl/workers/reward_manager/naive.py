@@ -121,6 +121,8 @@ class NaiveRewardManager(AbstractRewardManager):
 
             reward_tensor[i, valid_response_length - 1] = reward
 
+            # breakpoint()
+
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
 

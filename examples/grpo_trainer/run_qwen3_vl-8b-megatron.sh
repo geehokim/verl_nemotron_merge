@@ -46,11 +46,15 @@ python3 -m verl.trainer.main_ppo --config-path=config \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$GEN_TP \
-    actor_rollout_ref.actor.use_dynamic_bsz=True \
+    # Disable dynamic batch size to prevent OOM issues
+    # When use_dynamic_bsz=True, max_token_len = ppo_max_token_len_per_gpu * context_parallel_size
+    # With CP=2, this becomes 4096*2=8192 tokens per GPU, which may cause OOM
+    # If you want to use dynamic batching, reduce ppo_max_token_len_per_gpu (e.g., 2048 or 3072)
+    actor_rollout_ref.actor.use_dynamic_bsz=False \
     actor_rollout_ref.actor.ppo_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.ref.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=4096 \
-    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
+    actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False \
     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=4096 \
     actor_rollout_ref.rollout.name=$ENGINE \
     +actor_rollout_ref.rollout.engine_kwargs.vllm.disable_mm_preprocessor_cache=True \

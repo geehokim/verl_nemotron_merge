@@ -138,6 +138,10 @@ class RLHFDataset(Dataset):
         self.return_multi_modal_inputs = config.get("return_multi_modal_inputs", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed")
+        
+        # Optional suffix to append to user messages (e.g., "please reason step by step. answer with \\boxed{}")
+        # This allows adding instructions to prompts without modifying the dataset files
+        self.user_prompt_suffix = config.get("user_prompt_suffix", None)
 
         self._download()
         self._read_files_and_tokenize()
@@ -268,6 +272,23 @@ class RLHFDataset(Dataset):
 
     def _build_messages(self, example: dict):
         messages: list = example.pop(self.prompt_key)
+
+        # Add user_prompt_suffix to user messages if specified
+        # This allows adding instructions like "please reason step by step. answer with \\boxed{}"
+        # without modifying the dataset files
+        if self.user_prompt_suffix:
+            for message in messages:
+                if message.get("role") == "user":
+                    # Handle both string and list content formats
+                    if isinstance(message["content"], str):
+                        message["content"] = message["content"] + self.user_prompt_suffix
+                    elif isinstance(message["content"], list):
+                        # For multimodal content (list of dicts with type/text)
+                        # Find the last text segment and append suffix
+                        for item in reversed(message["content"]):
+                            if isinstance(item, dict) and item.get("type") == "text":
+                                item["text"] = item["text"] + self.user_prompt_suffix
+                                break
 
         if self.image_key in example or self.video_key in example:
             for message in messages:

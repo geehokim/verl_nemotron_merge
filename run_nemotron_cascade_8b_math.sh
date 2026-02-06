@@ -67,11 +67,12 @@ COMMON_ARGS=(
     data.train_batch_size=128
     data.max_prompt_length=2048
     data.filter_overlong_prompts=True
-    # Curriculum Sampler for dynamic filtering
-    data.sampler.class_path=verl.experimental.dataset.nemotron_cascade_sampler
-    data.sampler.class_name=NemotronCascadeCurriculumSampler
-    data.sampler.hard_resample_prob=0.10
-    data.sampler.easy_resample_prob=0.01
+    # Curriculum Sampler for dynamic filtering (requires num_workers=0)
+    data.dataloader_num_workers=0
+    +data.sampler.class_path=pkg://verl.experimental.dataset.nemotron_cascade_sampler
+    +data.sampler.class_name=NemotronCascadeCurriculumSampler
+    +data.sampler.hard_resample_prob=0.10
+    +data.sampler.easy_resample_prob=0.01
     # Actor config
     actor_rollout_ref.actor.optim.lr=2e-6
     actor_rollout_ref.actor.optim.lr_scheduler_type=cosine
@@ -85,11 +86,11 @@ COMMON_ARGS=(
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     actor_rollout_ref.actor.fsdp_config.param_offload=False
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False
-    # Rollout config
+    # Rollout config (optimized for speed)
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16
     actor_rollout_ref.rollout.tensor_model_parallel_size=1
     actor_rollout_ref.rollout.name=vllm
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7
     actor_rollout_ref.rollout.n=8
     actor_rollout_ref.rollout.top_p=0.95
     # Ref config
@@ -109,6 +110,9 @@ COMMON_ARGS=(
     trainer.save_freq=100
     trainer.test_freq=50
     trainer.val_before_train=False
+    actor_rollout_ref.actor.fsdp_config.param_offload=True \
+    actor_rollout_ref.actor.fsdp_config.optimizer_offload=True \
+    actor_rollout_ref.ref.fsdp_config.param_offload=True \
 )
 
 # =============================================================================

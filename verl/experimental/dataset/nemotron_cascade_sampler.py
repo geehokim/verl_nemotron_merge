@@ -30,6 +30,7 @@ Reference:
 """
 
 import logging
+import json
 from collections import defaultdict
 from collections.abc import Sized
 from typing import Iterator
@@ -41,6 +42,27 @@ from verl import DataProto
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 
 logger = logging.getLogger(__name__)
+
+# #region agent log - Debug instrumentation
+_DEBUG_LOG_PATH = "/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/.cursor/debug.log"
+def _debug_log(hypothesis_id: str, location: str, message: str, data: dict):
+    """Write debug log entry to NDJSON file."""
+    import time
+    try:
+        with open(_DEBUG_LOG_PATH, "a") as f:
+            entry = {
+                "hypothesisId": hypothesis_id,
+                "location": location,
+                "message": message,
+                "data": data,
+                "timestamp": int(time.time() * 1000),
+                "sessionId": "debug-session",
+                "runId": "sampler-debug"
+            }
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 
 class NemotronCascadeCurriculumSampler(AbstractCurriculumSampler):
@@ -87,9 +109,26 @@ class NemotronCascadeCurriculumSampler(AbstractCurriculumSampler):
         self.data_source = data_source
         self.data_config = data_config
         
+        # #region agent log - Hypothesis A: Check data_config structure
+        _debug_log("A", "sampler.__init__", "data_config structure check", {
+            "data_config_type": str(type(data_config)),
+            "data_config_keys": list(data_config.keys()) if hasattr(data_config, 'keys') else "no keys method",
+            "has_hard_resample_prob": "hard_resample_prob" in data_config if hasattr(data_config, '__contains__') else False,
+            "has_sampler_key": "sampler" in data_config if hasattr(data_config, '__contains__') else False,
+            "raw_config": str(data_config)[:500],
+        })
+        # #endregion
+        
         # Resample probabilities from Nemotron-Cascade paper
         self.hard_resample_prob = data_config.get("hard_resample_prob", 0.10)
         self.easy_resample_prob = data_config.get("easy_resample_prob", 0.01)
+        
+        # #region agent log - Hypothesis A: Log actual values after parsing
+        _debug_log("A", "sampler.__init__", "parsed config values", {
+            "hard_resample_prob": self.hard_resample_prob,
+            "easy_resample_prob": self.easy_resample_prob,
+        })
+        # #endregion
         
         # Random seed for reproducibility
         self.seed = data_config.get("seed", 42)
@@ -147,14 +186,26 @@ class NemotronCascadeCurriculumSampler(AbstractCurriculumSampler):
                 - non_tensor_batch['index']: Problem indices
                 - non_tensor_batch.get('skip', None): Optional skip flags
         """
+        # #region agent log - Hypothesis E: Check if update is called
+        _debug_log("E", "sampler.update", "update method called", {
+            "non_tensor_batch_keys": list(batch.non_tensor_batch.keys()) if batch.non_tensor_batch else "None",
+        })
+        # #endregion
+        
         # Extract accuracy and index information
         acc_values = batch.non_tensor_batch.get("acc", None)
         if acc_values is None:
+            # #region agent log - Hypothesis C: No acc field
+            _debug_log("C", "sampler.update", "WARNING: No acc field", {"batch_keys": list(batch.non_tensor_batch.keys()) if batch.non_tensor_batch else "None"})
+            # #endregion
             logger.warning("No 'acc' field in batch.non_tensor_batch, skipping update")
             return
         
         indices = batch.non_tensor_batch.get("index", None)
         if indices is None:
+            # #region agent log - Hypothesis B: No index field
+            _debug_log("B", "sampler.update", "WARNING: No index field", {"batch_keys": list(batch.non_tensor_batch.keys()) if batch.non_tensor_batch else "None"})
+            # #endregion
             logger.warning("No 'index' field in batch, accuracy tracking may be inaccurate")
             return
         
@@ -176,6 +227,17 @@ class NemotronCascadeCurriculumSampler(AbstractCurriculumSampler):
         # Track epoch progress
         self.samples_seen_in_epoch += batch_size
         
+        # #region agent log - Hypothesis D: Track epoch progress
+        _debug_log("D", "sampler.update", "epoch progress", {
+            "batch_size": batch_size,
+            "samples_seen_in_epoch": self.samples_seen_in_epoch,
+            "epoch_size": self.epoch_size,
+            "current_epoch": self.current_epoch,
+            "num_problems_tracked": len(self.problem_accuracy),
+            "will_trigger_epoch_end": self.samples_seen_in_epoch >= self.epoch_size,
+        })
+        # #endregion
+        
         # Check if epoch completed
         if self.samples_seen_in_epoch >= self.epoch_size:
             self._on_epoch_end()
@@ -192,6 +254,14 @@ class NemotronCascadeCurriculumSampler(AbstractCurriculumSampler):
         3. Resample with specified probabilities
         4. Update active_indices
         """
+        # #region agent log - Hypothesis D: Epoch end triggered
+        _debug_log("D", "sampler._on_epoch_end", "epoch end triggered", {
+            "current_epoch": self.current_epoch,
+            "num_problems_in_accuracy_dict": len(self.problem_accuracy),
+            "sample_problem_acc": {k: v for k, v in list(self.problem_accuracy.items())[:5]} if self.problem_accuracy else {},
+        })
+        # #endregion
+        
         if not self.problem_accuracy:
             logger.info("No accuracy data collected, skipping epoch-end filtering")
             return
