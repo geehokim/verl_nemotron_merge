@@ -32,6 +32,7 @@
 
 set -x  # Enable command tracing for debugging
 set -e  # Exit on error
+export PYTHONWARNINGS="ignore::UserWarning:megatron"
 
 # =============================================================================
 # Environment Setup
@@ -57,6 +58,8 @@ export TORCHINDUCTOR_CACHE_DIR=/mnt/tmp/nsml/torchinductor
 export CUDA_CACHE_PATH=/mnt/tmp/nsml/cuda-cache
 export TMPDIR=/mnt/tmp/nsml/tmp
 
+export VLLM_LOGGING_LEVEL=DEBUG
+
 export WANDB_API_KEY="733bd860c7324e3d31ada0288891ee6f19d42c38"
 export PYTHONPATH="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
 
@@ -65,9 +68,11 @@ export PYTHONPATH="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge${PYTHONPATH:+:${PYTH
 # =============================================================================
 
 PROJECT_NAME="nemotron-cascade-swe"
-OUTPUT_DIR="/mnt/ddn/vuvlm/geeho/nemotron_cascade_swe_output/DeepSeek-R1-Distill-Qwen-1.5B-swe"
+OUTPUT_DIR="/mnt/ddn/vuvlm/geeho/nemotron_cascade_output/Qwen3-8B/swe/"
 # BASE_MODEL="/mnt/ddn/vuvlm/geeho/models/Nemotron-Cascade-8B-Intermediate-ckpts/Nemotron-Cascade-8B-RLHF"
-BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
+# BASE_MODEL="Qwen/Qwen3-8B"
+BASE_MODEL="/mnt/ddn/vuvlm/geeho/models/Nemotron-Cascade-8B"
 
 WORLD_SIZE=1
 MACHINE_GPU_COUNT=8
@@ -85,21 +90,51 @@ LOSS_AGG_MODE=seq-mean-token-sum-norm
 
 # Validation configuration
 ENABLE_SWEBENCH_VERIFIED_VAL=true
-SWEBENCH_VERIFIED_VAL_PARQUET="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/swe-bench-verified/test_verl_ready.parquet"
+SWEBENCH_VERIFIED_VAL_PARQUET="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/swe-bench-verified/test_verl_ready_30.parquet"
 SWEBENCH_VERIFIED_JSON="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/swe-bench-verified/test.jsonl"
 
 ENABLE_LCB24_VAL=false
-LCB24_JSON="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025.json"
-LCB24_VAL_PARQUET="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025_verl_ready.parquet"
+# LCB24_JSON="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025.json"
+# LCB24_VAL_PARQUET="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025_verl_ready.parquet"
 CUSTOM_REWARD_FN="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/eval/verl_custom_reward.py"
-VAL_ROLLOUT_N=1
-VAL_BATCH_SIZE=1
+VAL_ROLLOUT_N=4
+VAL_BATCH_SIZE=128
 
 # SWE-bench harness runtime options used by nemotron_evaluation/eval/verl_custom_reward.py
 export SWEBENCH_VERIFIED_JSON="${SWEBENCH_VERIFIED_JSON}"
 export SWEBENCH_HARNESS_TIMEOUT=1800
-export SWEBENCH_HARNESS_NAMESPACE=swebench
-export SWEBENCH_HARNESS_MODEL_NAME="deepseek-qwen-distill-1.5b-swe-val"
+# Namespace controls image mode:
+# - "none"/"null"/"" => local build mode
+# - e.g., "swebench" => remote prebuilt image pull mode
+SWEBENCH_HARNESS_NAMESPACE="${SWEBENCH_HARNESS_NAMESPACE:-none}"
+export SWEBENCH_HARNESS_NAMESPACE
+export SWEBENCH_HARNESS_MODEL_NAME="qwen3-8b-swe-val"
+
+# docker setting
+# # 1) docker 설치
+# sudo apt-get update
+# sudo apt-get install -y docker.io
+
+# # 2) /mnt/tmp 기반 daemon 디렉토리
+# sudo mkdir -p /mnt/tmp/nsml/docker/{data,exec,run}
+
+# # 3) dockerd를 /mnt/tmp 소켓/스토리지로 기동
+sudo bash -lc '
+mkdir -p /mnt/tmp/nsml/docker/{data,exec,run}
+nohup dockerd \
+  --host=unix:///mnt/tmp/nsml/docker/run/docker.sock \
+  --data-root=/mnt/tmp/nsml/docker/data \
+  --exec-root=/mnt/tmp/nsml/docker/exec \
+  --pidfile=/mnt/tmp/nsml/docker/run/dockerd.pid \
+  --group nsml \
+  --storage-driver=vfs \
+  --iptables=false \
+  --bridge=none \
+  --ip-forward=false \
+  --ip-masq=false \
+  > /mnt/tmp/nsml/docker/run/dockerd.log 2>&1 &
+'
+export DOCKER_HOST=unix:///mnt/tmp/nsml/docker/run/docker.sock
 
 # =============================================================================
 # Dataset Configuration
@@ -128,7 +163,7 @@ export SWEBENCH_HARNESS_MODEL_NAME="deepseek-qwen-distill-1.5b-swe-val"
 # =============================================================================
 
 train_files_list=(
-    "/path/to/your/swe_train_verl_ready.parquet"
+    "/mnt/ddn/vuvlm/geeho/datasets/Nemotron-Cascade-RL-SWE/train_16k_verl_ready_with_code_context.parquet"
 )
 
 if [ "${ENABLE_SWEBENCH_VERIFIED_VAL}" = "true" ]; then
@@ -137,18 +172,13 @@ if [ "${ENABLE_SWEBENCH_VERIFIED_VAL}" = "true" ]; then
         exit 1
     fi
     val_files_list=("${SWEBENCH_VERIFIED_VAL_PARQUET}")
-elif [ "${ENABLE_LCB24_VAL}" = "true" ]; then
-    if [ ! -f "${LCB24_VAL_PARQUET}" ]; then
-        echo "LiveCodeBench val parquet not found. Converting from JSON..."
-        python /mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/convert_livecodebench24_to_verl_parquet.py \
-            --input_json "${LCB24_JSON}" \
-            --output_parquet "${LCB24_VAL_PARQUET}"
-    fi
-    val_files_list=("${LCB24_VAL_PARQUET}")
 else
-    val_files_list=(
-        "/path/to/your/swe_val_verl_ready.parquet"
-    )
+    val_files_list=("${SWEBENCH_VERIFIED_VAL_PARQUET}")
+fi
+
+if [ -z "${CUSTOM_REWARD_FN:-}" ] || [ ! -f "${CUSTOM_REWARD_FN}" ]; then
+    echo "Missing custom reward function file: ${CUSTOM_REWARD_FN:-<unset>}"
+    exit 1
 fi
 
 # =============================================================================
@@ -162,10 +192,10 @@ COMMON_ARGS=(
     # Data configuration
     data.train_files=$train_files_list
     data.val_files=$val_files_list
-    data.train_batch_size=128
+    data.train_batch_size=16
     data.max_prompt_length=16384         # 16K input context
     data.max_response_length=16384       # 16K output length
-    data.filter_overlong_prompts=True
+    data.filter_overlong_prompts=False
 
     # Actor configuration (from paper: lr=2.5e-6)
     actor_rollout_ref.actor.optim.lr=1e-6
@@ -173,7 +203,7 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.optim.betas='[0.9,0.95]'
     actor_rollout_ref.model.use_remove_padding=True
     # Increased batch sizes for better stability (aligned with math config)
-    actor_rollout_ref.actor.ppo_mini_batch_size=128
+    actor_rollout_ref.actor.ppo_mini_batch_size=16
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=16
 
     # No KL regularization (from paper: "no KL regularization")
@@ -189,7 +219,7 @@ COMMON_ARGS=(
     actor_rollout_ref.rollout.temperature=1.0
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16
     actor_rollout_ref.rollout.name=vllm
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9  # Increased for better throughput
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.85  # Increased for better throughput
     actor_rollout_ref.rollout.max_num_batched_tokens=34816
     actor_rollout_ref.rollout.enable_chunked_prefill=True
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True
@@ -216,7 +246,7 @@ COMMON_ARGS=(
     trainer.n_gpus_per_node=$MACHINE_GPU_COUNT
     trainer.nnodes=$WORLD_SIZE
     trainer.test_freq=10
-    trainer.val_before_train=False
+    trainer.val_before_train=True
 
     # Memory optimization and advanced settings (aligned with stable math config)
     actor_rollout_ref.actor.fsdp_config.param_offload=True
@@ -293,8 +323,8 @@ echo "=============================================="
 HYDRA_FULL_ERROR=1  python3 -m verl.trainer.main_ppo \
     "${COMMON_ARGS[@]}" \
     actor_rollout_ref.model.path=$BASE_MODEL \
-    trainer.experiment_name="deepseek-qwen-distill-1.5b-swe" \
-    trainer.total_epochs=2 \
+    trainer.experiment_name="qwen3-1.7b-swe" \
+    trainer.total_epochs=1 \
     trainer.default_local_dir=$OUTPUT_DIR
 
 echo "=============================================="

@@ -39,7 +39,8 @@ Reference:
 import difflib
 import re
 import warnings
-from typing import Optional, TypedDict, Union
+import json
+from typing import Any, Optional, TypedDict, Union
 
 try:
     from unidiff import PatchedFile, PatchSet
@@ -68,6 +69,51 @@ SEARCH_REPLACE_REGEX = r"```.*?\n### (.*)?\n<<<<<<< SEARCH\n([\s\S]*?)\n=======\
 class FormatError(Exception):
     """Raised when the model output format is invalid."""
     pass
+
+
+# =============================================================================
+# Input Normalization
+# =============================================================================
+
+def _normalize_code_context(raw: Any) -> dict[str, str]:
+    """Normalize code_context into dict[path, content].
+
+    Supported input types:
+    - dict[path, content]
+    - list[{"file_path": ..., "content": ...}]
+    - JSON string for either of the above
+    """
+    if raw is None:
+        return {}
+
+    if isinstance(raw, dict):
+        out = {}
+        for k, v in raw.items():
+            if isinstance(k, str) and isinstance(v, str):
+                out[k] = v
+        return out
+
+    if isinstance(raw, list):
+        out = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            path = item.get("file_path")
+            content = item.get("content")
+            if isinstance(path, str) and isinstance(content, str):
+                out[path] = content
+        return out
+
+    if isinstance(raw, str):
+        text = raw.strip()
+        if not text:
+            return {}
+        try:
+            return _normalize_code_context(json.loads(text))
+        except Exception:
+            return {}
+
+    return {}
 
 
 # =============================================================================
@@ -508,7 +554,7 @@ def compute_score(
             }
         return -1.0
 
-    code_context = extra_info.get("code_context", {})
+    code_context = _normalize_code_context(extra_info.get("code_context", {}))
     problem_id = extra_info.get("problem_id", None)
 
     # Handle overlong filtering

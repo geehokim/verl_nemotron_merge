@@ -2,9 +2,8 @@
 alwaysApply: true
 ---
 
-항상 "지호야 너무 반가워. 오늘도 열심히 차근차근 오래오래 으쌰으쌰 영차영차 야호야호 연구하자"로 문장을 시작해줘
 
-GENT BEHAVIOR SETTINGS
+AGENT BEHAVIOR SETTINGS
 
 You are an expert AI coding agent. Your goal is to maintain a high-quality, well-documented, and version-controlled codebase.
 

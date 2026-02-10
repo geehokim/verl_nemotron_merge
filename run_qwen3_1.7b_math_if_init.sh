@@ -61,8 +61,8 @@ export PYTHONPATH="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge${PYTHONPATH:+:${PYTH
 # Configuration
 # =============================================================================
 
-PROJECT_NAME="nemotron-cascade-math"
-OUTPUT_DIR="/mnt/ddn/vuvlm/geeho/nemotron_cascade_output/Qwen3-1.7B-math"
+PROJECT_NAME="nemotron-cascade-parallel"
+OUTPUT_DIR="/mnt/ddn/vuvlm/geeho/nemotron_cascade_output/Qwen3-1.7B-if-math"
 # BASE_MODEL="/mnt/ddn/vuvlm/geeho/models/Nemotron-Cascade-8B-Intermediate-ckpts/Nemotron-Cascade-8B-RLHF"
 BASE_MODEL="Qwen/Qwen3-1.7B"
 # BASE_MODEL="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
@@ -77,18 +77,12 @@ MACHINE_GPU_COUNT=8
 VLLM_USE_V1=1
 
 # Checkpoint settings for OOM recovery
-SAVE_FREQ=10                     # Save checkpoint every iteration for OOM recovery
+SAVE_FREQ=20                     # Save checkpoint every iteration for OOM recovery
 
 DTYPE=float16
 LOSS_AGG_MODE=seq-mean-token-sum-norm
 # LOSS_AGG_MODE=token-mean
 
-# LiveCodeBench validation configuration
-ENABLE_LCB24_VAL=true
-LCB24_JSON="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025.json"
-LCB24_VAL_PARQUET="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/livecodebench/test_aug2024tojan2025_verl_ready.parquet"
-CUSTOM_REWARD_FN="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/eval/verl_custom_reward.py"
-VAL_ROLLOUT_N=1
 
 train_files_list=(
     # "/mnt/ddn/vuvlm/geeho/Precision-RL-verl/sanity_test/math_1460_nemotron.parquet"
@@ -99,7 +93,6 @@ train_files_list=(
 val_files_list=(
     "/mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/data/aime25/test_verl_ready_with_instruction.parquet"
 )
-    
 
 # =============================================================================
 # Common Training Arguments (shared across all stages)
@@ -109,7 +102,7 @@ COMMON_ARGS=(
     algorithm.adv_estimator=grpo
     data.train_files=$train_files_list
     data.val_files=$val_files_list
-    data.train_batch_size=32
+    data.train_batch_size=64
     data.max_prompt_length=2048
     data.filter_overlong_prompts=True
     # Add instruction to user prompts: "please reason step by step. answer with \\boxed{}"
@@ -125,13 +118,13 @@ COMMON_ARGS=(
     # actor_rollout_ref.actor.optim.lr_scheduler_type=cosine
     actor_rollout_ref.actor.optim.betas='[0.9,0.95]'
     actor_rollout_ref.model.use_remove_padding=True
-    actor_rollout_ref.actor.ppo_mini_batch_size=32
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=32
+    actor_rollout_ref.actor.ppo_mini_batch_size=64
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=64
     # KL loss and entropy regularization for better training stability
     # kl_loss_coef: Controls KL divergence penalty between actor and reference model
     # entropy_coeff: Entropy bonus to encourage exploration
-    actor_rollout_ref.actor.use_kl_loss=False
-    actor_rollout_ref.actor.kl_loss_coef=0.000
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=0.002
     actor_rollout_ref.actor.entropy_coeff=0.0
     actor_rollout_ref.model.enable_gradient_checkpointing=True
     # Rollout config (optimized for speed)
@@ -182,8 +175,8 @@ COMMON_ARGS=(
     data.val_batch_size=128
     data.validation_shuffle=False
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6
-    actor_rollout_ref.rollout.val_kwargs.top_p=0.95
-    actor_rollout_ref.rollout.val_kwargs.n=$VAL_ROLLOUT_N
+    actor_rollout_ref.rollout.val_kwargs.top_p=1.0
+    actor_rollout_ref.rollout.val_kwargs.n=8
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
     actor_rollout_ref.model.trust_remote_code=True
     actor_rollout_ref.rollout.tensor_model_parallel_size=1  
@@ -197,25 +190,25 @@ COMMON_ARGS=(
 # STAGE 1: 2 epochs, max_len=24000, temp=1.0, overlong_filtering=True
 # =============================================================================
 
-# echo "=============================================="
-# echo "Starting STAGE 1: 1 epochs (~228 iterations)"
-# echo "  max_response_length=4096"
-# echo "  temperature=1.0"
-# echo "  overlong_filtering=True"
-# echo "  resume_mode=auto (will resume from checkpoint if exists)"
-# echo "=============================================="
+echo "=============================================="
+echo "Starting STAGE 1: 1 epochs (~228 iterations)"
+echo "  max_response_length=24000"
+echo "  temperature=1.0"
+echo "  overlong_filtering=True"
+echo "  resume_mode=auto (will resume from checkpoint if exists)"
+echo "=============================================="
 
-# HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
-#     "${COMMON_ARGS[@]}" \
-#     actor_rollout_ref.model.path=$BASE_MODEL \
-#     data.max_response_length=24576 \
-#     actor_rollout_ref.rollout.temperature=1.0 \
-#     +reward_model.reward_kwargs.overlong_filtering=True \
-#     trainer.experiment_name="qwen3-1.7b-math-stage1" \
-#     trainer.total_epochs=2 \
-#     trainer.default_local_dir=$OUTPUT_DIR/stage1
+HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
+    "${COMMON_ARGS[@]}" \
+    actor_rollout_ref.model.path=$BASE_MODEL \
+    data.max_response_length=24576 \
+    actor_rollout_ref.rollout.temperature=1.0 \
+    +reward_model.reward_kwargs.overlong_filtering=True \
+    trainer.experiment_name="qwen3-1.7b-math-if_init_stage1" \
+    trainer.total_epochs=1 \
+    trainer.default_local_dir=$OUTPUT_DIR/stage1
 
-# echo "STAGE 1 Complete!"
+echo "STAGE 1 Complete!"
 
 # =============================================================================
 # STAGE 2: 2 epochs, max_len=32000, temp=1.0, overlong_filtering=False
