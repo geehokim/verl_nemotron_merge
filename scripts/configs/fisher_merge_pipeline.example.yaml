@@ -1,0 +1,92 @@
+runtime:
+  output_root: /mnt/ddn/vuvlm/geeho/nemotron_cascade_output/qwen3_1.7b_fisher_pipeline_verbose
+  # If /home/nsml/verl/bin/python exists, this is a safe default.
+  python_executable: /home/nsml/verl/bin/python
+  default_gpu_ids: [4, 5, 6, 7]
+  seed: 42
+  project_name: fisher-merge-pipeline
+  use_wandb_logger: false
+  reward_wrapper_path: scripts/fisher_rollout_reward_wrapper.py
+  verbose_console: true
+
+merge:
+  epsilon: 1.0e-12
+  # Fisher merge lambda_i coefficients by task name.
+  lambdas:
+    if: 1.0
+    math: 1.0
+  # Optional. If null, first task model path is used as architecture/tokenizer anchor.
+  anchor_model_path: null
+  output_subdir: fisher_merge_if_math
+  model_dtype: bf16
+
+tasks:
+  - name: if
+    model_path: /mnt/ddn/vuvlm/geeho/nemotron_cascade_output/Qwen3-1.7B-ifrl_ifeval/global_step_50/actor/huggingface
+    input_parquet: /mnt/ddn/vuvlm/geeho/verl_nemotron_merge/merging_analysis/merging_analysis/artifacts/jwcm_v2/validation_data/val_if_512.parquet
+    input_format: if_raw
+    data_source: nemotron_cascade_rl_if
+    # Use strict IF reward evaluator as base function.
+    base_reward_function_path: /mnt/ddn/vuvlm/geeho/verl_nemotron_merge/nemotron_evaluation/eval/verl_custom_reward.py
+    base_reward_function_name: compute_score
+    correctness_score_threshold: 0.5
+    gpu_ids: [4, 5, 6, 7]
+    rollout:
+      n: 8
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 20
+      do_sample: true
+      max_new_tokens: 512
+      max_prompt_length: 2048
+      val_batch_size: 256
+      train_batch_size: 1
+      gpu_memory_utilization: 0.9
+      max_num_batched_tokens: 34816
+      log_prob_micro_batch_size_per_gpu: 8
+      ulysses_sequence_parallel_size: 4
+      mode: async
+      rollout_name: vllm
+    fisher:
+      device: cuda:0
+      model_dtype: bf16
+      max_prompt_tokens: 1536
+      max_response_tokens: 512
+      max_correct_trajectories: 1024
+      log_every: 10
+
+  - name: math
+    model_path: /mnt/ddn/vuvlm/geeho/nemotron_cascade_output/Qwen3-1.7B-math/stage2/global_step_40/actor/huggingface
+    input_parquet: /mnt/ddn/vuvlm/geeho/verl_nemotron_merge/merging_analysis/merging_analysis/artifacts/jwcm_v2/validation_data/val_math_512.parquet
+    # val_math_512 has data_source/prompt/reward_model, so `auto` resolves to `verl_ready`.
+    input_format: auto
+    data_source: nemotron_cascade_rl_math
+    # Use default reward router for math branch if base path is null.
+    base_reward_function_path: null
+    base_reward_function_name: compute_score
+    correctness_score_threshold: 0.5
+    gpu_ids: [4, 5, 6, 7]
+    rollout:
+      n: 4
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
+      do_sample: true
+      max_new_tokens: 768
+      max_prompt_length: 2048
+      val_batch_size: 256
+      train_batch_size: 1
+      gpu_memory_utilization: 0.9
+      max_num_batched_tokens: 34816
+      log_prob_micro_batch_size_per_gpu: 8
+      ulysses_sequence_parallel_size: 4
+      mode: async
+      rollout_name: vllm
+    fisher:
+      device: cuda:0
+      model_dtype: bf16
+      max_prompt_tokens: 1536
+      max_response_tokens: 768
+      max_correct_trajectories: 1024
+      log_every: 10
+
