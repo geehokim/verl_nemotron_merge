@@ -792,7 +792,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dtype",
         type=str,
-        default="bf16",
+        default="fp32",
         choices=["bf16", "fp16", "fp32"],
         help="Model loading dtype.",
     )

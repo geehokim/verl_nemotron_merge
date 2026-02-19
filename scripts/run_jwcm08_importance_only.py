@@ -255,6 +255,7 @@ def load_causal_lm(
     model_name_or_path: str | Path,
     torch_dtype: torch.dtype,
     device: str,
+    attn_implementation: str | None = None,
 ) -> tuple[AutoModelForCausalLM, AutoTokenizer]:
     """Load causal LM and tokenizer on target device.
 
@@ -262,19 +263,28 @@ def load_causal_lm(
         model_name_or_path: Hugging Face model id or local checkpoint path.
         torch_dtype: Weight dtype for loading.
         device: Runtime device string.
+        attn_implementation: Optional attention backend override.
+            Supported values: ``"flash_attention_2"``, ``"sdpa"``, ``"eager"``.
+            When ``None``, the model's default attention implementation is used.
+            ``"flash_attention_2"`` requires the ``flash_attn`` package and can
+            give 2-4x speedup on both forward and backward passes.
 
     Returns:
         Tuple `(model, tokenizer)`.
     """
 
     resolved_path = str(model_name_or_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        resolved_path,
-        torch_dtype=torch_dtype,
-        device_map=None,
-        low_cpu_mem_usage=True,
-        trust_remote_code=True,
-    )
+    # Build model kwargs, conditionally adding attn_implementation to stay
+    # backwards-compatible with older transformers versions.
+    model_kwargs: dict[str, Any] = {
+        "torch_dtype": torch_dtype,
+        "device_map": None,
+        "low_cpu_mem_usage": True,
+        "trust_remote_code": True,
+    }
+    if attn_implementation is not None:
+        model_kwargs["attn_implementation"] = str(attn_implementation)
+    model = AutoModelForCausalLM.from_pretrained(resolved_path, **model_kwargs)
     model.to(device)
     model.eval()
 
@@ -352,6 +362,32 @@ def build_mode_suffix(mode: str, top_p: float) -> str:
 
 
 @torch.no_grad()
+def _gather_target_log_probs_from_logits(
+    logits: torch.Tensor,
+    shifted_positions: torch.Tensor,
+    target_token_ids: torch.Tensor,
+) -> torch.Tensor:
+    """Gather target-token log-probabilities without full `log_softmax` materialization.
+
+    This helper preserves the exact token log-probability values while reducing
+    peak memory by avoiding an explicit `[T, vocab]` `log_softmax` tensor.
+
+    Args:
+        logits: Model logits with shape `[1, seq_len, vocab_size]`.
+        shifted_positions: Positions of predictor logits (`token_position - 1`).
+        target_token_ids: Target token ids for each selected position.
+
+    Returns:
+        1D tensor of target log-probabilities for selected positions.
+    """
+
+    selected_logits = logits[0, shifted_positions, :].to(torch.float32)
+    target_logits = selected_logits.gather(dim=1, index=target_token_ids.unsqueeze(1)).squeeze(1)
+    normalization = torch.logsumexp(selected_logits, dim=-1)
+    return target_logits - normalization
+
+
+@torch.no_grad()
 def _compute_token_delta_rows_for_sequence(
     task_name: str,
     sample_id: int,
@@ -386,21 +422,29 @@ def _compute_token_delta_rows_for_sequence(
 
     full_batch = full_ids.unsqueeze(0)
     full_attention = torch.ones_like(full_batch, device=device)
-
-    rl_logits = rl_model(input_ids=full_batch, attention_mask=full_attention).logits
-    base_logits = base_model(input_ids=full_batch, attention_mask=full_attention).logits
-
-    # Autoregressive likelihood at position `t` uses logits at `t-1`.
-    rl_log_probs = torch.log_softmax(rl_logits[:, :-1, :].to(torch.float32), dim=-1)
-    base_log_probs = torch.log_softmax(base_logits[:, :-1, :].to(torch.float32), dim=-1)
-
     full_len = int(full_ids.shape[0])
     positions = torch.arange(prompt_len, full_len, device=device)
     shifted_positions = positions - 1
     target_token_ids = full_ids[positions]
 
-    rl_token_logp = rl_log_probs[0, shifted_positions, target_token_ids]
-    base_token_logp = base_log_probs[0, shifted_positions, target_token_ids]
+    # Compute RL/Base token log-probs sequentially to avoid holding both large
+    # logits tensors in memory at the same time.
+    rl_outputs = rl_model(input_ids=full_batch, attention_mask=full_attention, use_cache=False)
+    rl_token_logp = _gather_target_log_probs_from_logits(
+        logits=rl_outputs.logits,
+        shifted_positions=shifted_positions,
+        target_token_ids=target_token_ids,
+    )
+    del rl_outputs
+
+    base_outputs = base_model(input_ids=full_batch, attention_mask=full_attention, use_cache=False)
+    base_token_logp = _gather_target_log_probs_from_logits(
+        logits=base_outputs.logits,
+        shifted_positions=shifted_positions,
+        target_token_ids=target_token_ids,
+    )
+    del base_outputs
+
     delta_logp = rl_token_logp - base_token_logp
 
     for idx in range(int(positions.numel())):

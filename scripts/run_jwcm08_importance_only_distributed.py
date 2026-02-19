@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import inspect
 import math
 import os
 import sys
@@ -204,6 +205,15 @@ def parse_args() -> argparse.Namespace:
         help="Approximate global backprop token budget per mode. Use -1 for unlimited.",
     )
     parser.add_argument(
+        "--exact-token-grad-split",
+        action="store_true",
+        help=(
+            "For `exact_token_abs`, split gradients by critical token using prefix-only "
+            "forward passes. This keeps the attribution formula unchanged for causal LMs "
+            "while reducing peak memory, at the cost of extra runtime."
+        ),
+    )
+    parser.add_argument(
         "--no-normalize-by-token-count",
         action="store_true",
         help="Disable normalization by global processed token count.",
@@ -234,6 +244,41 @@ def parse_args() -> argparse.Namespace:
         "--math-rollout-path",
         type=Path,
         default=DEFAULT_FISHER_TASK_ROOT / "math" / "correct_rollout_trajectories.parquet",
+    )
+
+    # ── Performance / optimization flags ──────────────────────────────────
+    parser.add_argument(
+        "--attn-implementation",
+        type=str,
+        choices=["flash_attention_2", "sdpa", "eager"],
+        default=None,
+        help=(
+            "Attention backend override for model loading. "
+            "'flash_attention_2' requires the flash_attn package and gives "
+            "2-4x speedup on attention forward/backward. "
+            "'sdpa' uses PyTorch's built-in Scaled Dot Product Attention. "
+            "Default (None) uses the model's default."
+        ),
+    )
+    parser.add_argument(
+        "--gradient-checkpointing",
+        action="store_true",
+        help=(
+            "Enable gradient checkpointing on the task model during attribution. "
+            "Trades ~30%% extra compute for significantly less activation memory, "
+            "which allows using non-split mode (no --exact-token-grad-split) on "
+            "longer sequences without OOM."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-zero-delta-params",
+        action="store_true",
+        help=(
+            "Freeze (requires_grad=False) parameters whose abs_delta is exactly "
+            "zero. This avoids computing gradients for unchanged parameters and "
+            "can significantly speed up backward passes when many parameters were "
+            "frozen during RL fine-tuning (e.g., embeddings, LM head)."
+        ),
     )
 
     parser.add_argument(
@@ -615,6 +660,240 @@ def select_local_critical_tokens_with_global_threshold(
     return critical_df
 
 
+def freeze_zero_delta_parameters(
+    task_model: AutoModelForCausalLM,
+    abs_delta: Mapping[str, torch.Tensor],
+    context: DistributedContext,
+) -> int:
+    """Freeze parameters whose abs_delta is exactly zero.
+
+    Parameters with zero abs_delta contribute nothing to importance scores
+    (importance_i = |grad_i| * |delta_i| = 0 when delta_i = 0), so computing
+    their gradients is pure waste.  Setting ``requires_grad_(False)`` on these
+    parameters lets PyTorch's autograd engine skip gradient computation for
+    them, which can significantly speed up each backward pass.
+
+    Typical RL fine-tuning freezes embeddings and the LM head, making this
+    optimization particularly effective.
+
+    Args:
+        task_model: Task model whose parameters may be selectively frozen.
+        abs_delta: Absolute task vector mapping parameter names to |Δθ|.
+        context: Distributed context (for logging).
+
+    Returns:
+        Number of frozen parameters.
+    """
+
+    frozen_count = 0
+    total_count = 0
+    frozen_numel = 0
+    total_numel = 0
+
+    for name, param in task_model.named_parameters():
+        total_count += 1
+        total_numel += param.numel()
+        if name in abs_delta:
+            # Check if this parameter's abs_delta is entirely zero.
+            delta_sum = abs_delta[name].sum().item()
+            if delta_sum == 0.0:
+                param.requires_grad_(False)
+                frozen_count += 1
+                frozen_numel += param.numel()
+        else:
+            # Parameter not in abs_delta → no contribution to importance.
+            param.requires_grad_(False)
+            frozen_count += 1
+            frozen_numel += param.numel()
+
+    rank_zero_print(
+        context,
+        f"  [freeze-zero-delta] Frozen {frozen_count}/{total_count} parameters "
+        f"({frozen_numel:,}/{total_numel:,} elements, "
+        f"{100.0 * frozen_numel / max(total_numel, 1):.1f}%)",
+    )
+    return frozen_count
+
+
+def unfreeze_all_parameters(task_model: AutoModelForCausalLM) -> None:
+    """Restore requires_grad=True on all parameters.
+
+    Call this after attribution to clean up side effects from
+    ``freeze_zero_delta_parameters``.
+
+    Args:
+        task_model: Model to unfreeze.
+    """
+
+    for param in task_model.parameters():
+        param.requires_grad_(True)
+
+
+def _resolve_logits_keep_argument_name(task_model: AutoModelForCausalLM) -> str | None:
+    """Resolve optional forward kwarg name for keeping only trailing logits.
+
+    Some Hugging Face causal-LM implementations expose a forward argument such as
+    `num_logits_to_keep` (or `logits_to_keep`) that limits returned logits to the
+    last N positions. Using this option can reduce output-memory pressure without
+    changing token-logprob values for the kept positions.
+
+    Args:
+        task_model: Task model used for attribution.
+
+    Returns:
+        Matching kwarg name if supported, otherwise `None`.
+    """
+
+    parameter_names = set(inspect.signature(task_model.forward).parameters.keys())
+    if "num_logits_to_keep" in parameter_names:
+        return "num_logits_to_keep"
+    if "logits_to_keep" in parameter_names:
+        return "logits_to_keep"
+    return None
+
+
+def _resolve_transformer_body_and_head(
+    task_model: AutoModelForCausalLM,
+) -> tuple:
+    """Identify the transformer body and LM head sub-modules.
+
+    Most HuggingFace CausalLM models follow a two-part structure:
+      1. ``model.model`` (or ``model.transformer``): the transformer body that
+         maps ``input_ids`` → hidden states ``[batch, seq_len, hidden_dim]``.
+      2. ``model.lm_head``: a ``nn.Linear`` that projects hidden states to
+         vocabulary logits ``[batch, seq_len, vocab_size]``.
+
+    Splitting the forward pass lets us apply the LM head to **only** the
+    critical positions, avoiding a full ``[1, seq_len, vocab_size]`` logits
+    tensor (~7.2 GB for 24k×150k bf16) and—critically—its dense backward
+    gradient (~14.4 GB fp32).  Instead, we only materialize logits for
+    ``num_critical`` positions, which is typically 10-100× smaller.
+
+    Args:
+        task_model: HuggingFace CausalLM model.
+
+    Returns:
+        ``(transformer_body, lm_head)`` if the model structure is recognized,
+        otherwise ``(None, None)`` (caller should fall back to full forward).
+    """
+
+    # LLaMA, Qwen, Mistral, Gemma family: model.model + model.lm_head
+    if hasattr(task_model, "model") and hasattr(task_model, "lm_head"):
+        body = getattr(task_model, "model")
+        head = getattr(task_model, "lm_head")
+        # Sanity: body should be an nn.Module, head should be Linear-like.
+        if isinstance(body, torch.nn.Module) and isinstance(head, torch.nn.Module):
+            return body, head
+
+    # GPT-2, GPT-J family: model.transformer + model.lm_head
+    if hasattr(task_model, "transformer") and hasattr(task_model, "lm_head"):
+        body = getattr(task_model, "transformer")
+        head = getattr(task_model, "lm_head")
+        if isinstance(body, torch.nn.Module) and isinstance(head, torch.nn.Module):
+            return body, head
+
+    return None, None
+
+
+def _compute_target_log_prob_from_token_logits(
+    token_logits_fp32: torch.Tensor,
+    target_id: int,
+) -> torch.Tensor:
+    """Compute scalar log-probability for one target token from one-step logits.
+
+    This helper avoids materializing full `log_softmax` tensors by using the exact
+    identity:
+        log p(target) = logit[target] - logsumexp(logits)
+
+    Args:
+        token_logits_fp32: One-step logits vector on fp32 (`[vocab_size]`).
+        target_id: Target token id whose log-probability is needed.
+
+    Returns:
+        Scalar log-probability tensor.
+    """
+
+    return token_logits_fp32[int(target_id)] - torch.logsumexp(token_logits_fp32, dim=-1)
+
+
+def _compute_exact_token_log_prob_with_prefix_forward(
+    task_model: AutoModelForCausalLM,
+    full_ids_device: torch.Tensor,
+    token_position: int,
+    target_id: int,
+    logits_keep_argument_name: str | None,
+) -> torch.Tensor:
+    """Compute exact token log-probability via prefix-only forward pass.
+
+    Why this is exact:
+    - For causal LMs, the probability of token at position `t` depends only on
+      prefix tokens up to `t-1`.
+    - Therefore, forwarding only the prefix and reading the final-step logits
+      yields the same conditional log-probability as forwarding the full sequence.
+
+    Args:
+        task_model: Task model used for attribution.
+        full_ids_device: Full token ids as a 1D tensor on device.
+        token_position: Absolute token position (`t`) of target token.
+        target_id: Target token id at position `t`.
+        logits_keep_argument_name: Optional model-specific kwarg name to keep only
+            trailing logits (`N=1`).
+
+    Returns:
+        Scalar log-probability tensor for `log p(y_t | prefix)`.
+    """
+
+    prefix_ids = full_ids_device[: int(token_position)].unsqueeze(0)
+    forward_kwargs: Dict[str, Any] = {
+        "input_ids": prefix_ids,
+        "use_cache": False,
+    }
+    if logits_keep_argument_name is not None:
+        # Request last-position logits only when the model supports this API.
+        forward_kwargs[str(logits_keep_argument_name)] = 1
+
+    outputs = task_model(**forward_kwargs)
+    token_logits_fp32 = outputs.logits[0, -1, :].to(torch.float32)
+    return _compute_target_log_prob_from_token_logits(
+        token_logits_fp32=token_logits_fp32,
+        target_id=int(target_id),
+    )
+
+
+def _accumulate_grads_to_importance_cpu(
+    grads: tuple[torch.Tensor | None, ...],
+    param_names: List[str],
+    importance_cpu: Dict[str, torch.Tensor],
+    abs_delta_cpu: Mapping[str, torch.Tensor],
+) -> None:
+    """Accumulate ``|grad| * |Δθ|`` into CPU importance buffers.
+
+    Gradients arrive on GPU from ``torch.autograd.grad``.  This helper moves
+    each gradient to CPU, computes the element-wise product with the
+    already-CPU abs_delta, and accumulates in-place.  This avoids keeping
+    two full-model-sized fp32 tensors (abs_delta + importance) on GPU,
+    saving ~13 GB of VRAM for a 1.7B-param model.
+
+    The CPU transfer per backward pass adds only ~1-2 % overhead because
+    the dominant cost is the forward + backward pass itself (seconds).
+
+    Args:
+        grads: Gradient tuple from ``torch.autograd.grad``.
+        param_names: Parameter name list aligned with ``grads``.
+        importance_cpu: CPU importance accumulator (modified in-place).
+        abs_delta_cpu: CPU absolute task vector.
+    """
+
+    for grad_index, grad in enumerate(grads):
+        if grad is None:
+            continue
+        name = param_names[grad_index]
+        if name in importance_cpu:
+            # GPU → CPU transfer, then in-place abs + mul + add on CPU.
+            grad_abs_cpu = grad.detach().to(dtype=torch.float32, device="cpu").abs_()
+            importance_cpu[name].add_(grad_abs_cpu.mul_(abs_delta_cpu[name]))
+
+
 def compute_importance_scores_distributed(
     task_model: AutoModelForCausalLM,
     local_critical_payload: Sequence[Mapping[str, Any]],
@@ -622,37 +901,81 @@ def compute_importance_scores_distributed(
     cfg: AttributionConfig,
     context: DistributedContext,
     device: str,
+    exact_token_grad_split: bool = False,
+    enable_gradient_checkpointing: bool = False,
+    freeze_zero_delta: bool = False,
 ) -> tuple[Dict[str, torch.Tensor] | None, Dict[str, Any]]:
     """Compute and reduce JWCM importance scores across distributed ranks.
 
-    Implementation strategy:
-    - Each rank accumulates local partial importance on GPU.
-    - GPU tensors are reduced (SUM) to rank 0.
+    Memory-optimized implementation:
+    - ``abs_delta`` and ``importance`` buffers stay on **CPU** to save ~13 GB
+      of GPU VRAM (for a 1.7B model).  Gradients are moved GPU → CPU after
+      each backward pass for accumulation.  The overhead is negligible (~2 %)
+      because the forward + backward pass dominates runtime.
+    - GPU tensors are only allocated temporarily for distributed reduction.
     - Rank 0 applies global normalization and returns CPU tensors.
+
+    Performance optimizations (controllable via args):
+    - ``freeze_zero_delta``: Freeze parameters with zero abs_delta to skip
+      their gradient computation during backward passes.
+    - ``enable_gradient_checkpointing``: Trade ~30 % extra compute for
+      significantly less activation memory, enabling non-split mode on
+      longer sequences.
 
     Args:
         task_model: Task model for gradient computation.
         local_critical_payload: Rank-local critical-sequence payload.
-        abs_delta: Absolute task vector (`|Δθ|`) on CPU.
+        abs_delta: Absolute task vector (``|Δθ|``) on CPU.
         cfg: Attribution config.
         context: Distributed context.
         device: Runtime device.
+        exact_token_grad_split: If ``True`` and ``cfg.mode == "exact_token_abs"``,
+            compute each critical token gradient with a separate prefix-only
+            forward pass.  Mathematically equivalent for causal LMs and
+            reduces peak memory by avoiding long retained graphs.
+        enable_gradient_checkpointing: If ``True``, enable gradient checkpointing
+            on the task model before the attribution loop.
+        freeze_zero_delta: If ``True``, freeze parameters with zero abs_delta
+            before computing gradients.
 
     Returns:
         Tuple:
-        - Rank 0: global importance dictionary on CPU; other ranks: `None`
+        - Rank 0: global importance dictionary on CPU; other ranks: ``None``
         - Metadata dictionary with local/global counters
     """
 
-    abs_delta_gpu: Dict[str, torch.Tensor] = {
-        name: tensor.to(device, non_blocking=True)
+    # ── Optimization: freeze zero-delta parameters ──────────────────────
+    frozen_param_count = 0
+    if freeze_zero_delta:
+        frozen_param_count = freeze_zero_delta_parameters(
+            task_model=task_model,
+            abs_delta=abs_delta,
+            context=context,
+        )
+
+    # ── Optimization: gradient checkpointing ────────────────────────────
+    if enable_gradient_checkpointing:
+        task_model.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False},
+        )
+        rank_zero_print(context, "  [gradient-checkpointing] Enabled")
+
+    # ── CPU-side importance accumulation ─────────────────────────────────
+    # Keep abs_delta (already on CPU) and importance buffers on CPU to save
+    # ~13 GB of GPU VRAM.  Gradients are moved from GPU → CPU after each
+    # backward pass for in-place accumulation.
+    abs_delta_cpu: Dict[str, torch.Tensor] = {
+        name: tensor.to(dtype=torch.float32)
         for name, tensor in abs_delta.items()
     }
-    importance_gpu: Dict[str, torch.Tensor] = {
-        name: torch.zeros_like(tensor)
-        for name, tensor in abs_delta_gpu.items()
+    importance_accum: Dict[str, torch.Tensor] = {
+        name: torch.zeros_like(tensor, dtype=torch.float32)
+        for name, tensor in abs_delta_cpu.items()
     }
 
+    # Only include parameters that still require gradients (i.e., those NOT
+    # frozen by freeze_zero_delta).  This keeps param_list lean and avoids
+    # autograd overhead for irrelevant parameters.
     param_entries = [
         (name, parameter)
         for name, parameter in task_model.named_parameters()
@@ -660,6 +983,22 @@ def compute_importance_scores_distributed(
     ]
     param_names = [name for name, _ in param_entries]
     param_list = [parameter for _, parameter in param_entries]
+    logits_keep_argument_name = _resolve_logits_keep_argument_name(task_model=task_model)
+
+    # ── Resolve transformer body / LM head for memory-efficient forward ──
+    # For sequence_sum_approx, splitting body + head avoids materializing
+    # the full [1, seq_len, vocab_size] logits tensor AND its ~14 GB
+    # backward gradient.  Instead, logits are computed only at critical
+    # positions, reducing memory from ~22 GB to ~2 GB (for 2000 positions).
+    transformer_body, lm_head = _resolve_transformer_body_and_head(task_model=task_model)
+    use_split_forward = transformer_body is not None and lm_head is not None
+
+    rank_zero_print(
+        context,
+        f"  [attribution] grad-enabled params: {len(param_list)}, "
+        f"mode={cfg.mode}, grad_split={exact_token_grad_split}, "
+        f"importance_device=cpu, split_forward={use_split_forward}",
+    )
 
     # Convert global budget to approximate per-rank budget for distributed runs.
     if cfg.max_backprop_tokens is None:
@@ -669,16 +1008,42 @@ def compute_importance_scores_distributed(
     else:
         local_backprop_budget = int(cfg.max_backprop_tokens)
 
+    # ── Sort payload: process shorter sequences first ───────────────────
+    sorted_payload = sorted(
+        local_critical_payload,
+        key=lambda x: len(x.get("critical_positions", [])),
+    )
+
+    # Count total critical tokens across all sequences for the inner bar.
+    total_critical_tokens = sum(
+        len([pos for pos in entry.get("critical_positions", []) if int(pos) > 0])
+        for entry in sorted_payload
+    )
+    rank_zero_print(
+        context,
+        f"  [attribution] sequences={len(sorted_payload)}, "
+        f"total_critical_tokens={total_critical_tokens}",
+    )
+
     processed_sequences_local = 0
     processed_tokens_local = 0
     hit_local_budget = False
 
-    iterator = tqdm(
-        local_critical_payload,
+    # Outer progress bar: per-sequence.
+    seq_pbar = tqdm(
+        sorted_payload,
         desc=f"Rank{context.rank:02d} Attribution ({cfg.mode})",
         disable=(context.rank != 0),
     )
-    for entry in iterator:
+    # Inner progress bar: per-token (shows real progress within sequences).
+    token_pbar = tqdm(
+        total=total_critical_tokens,
+        desc=f"Rank{context.rank:02d} Tokens",
+        disable=(context.rank != 0),
+        leave=False,
+    )
+
+    for entry in seq_pbar:
         if hit_local_budget:
             break
 
@@ -687,82 +1052,265 @@ def compute_importance_scores_distributed(
         if not critical_positions:
             continue
 
-        full_ids = full_ids_cpu.to(device).unsqueeze(0)
-        outputs = task_model(input_ids=full_ids)
-        logits = outputs.logits
+        # Keep branch-specific sequence tensors explicitly tracked so cleanup at
+        # loop tail is deterministic regardless of which attribution path ran.
+        full_ids: torch.Tensor | None = None
+        full_ids_device: torch.Tensor | None = None
+
+        # Update outer bar postfix with sequence metadata for debugging.
+        if context.rank == 0:
+            seq_pbar.set_postfix(
+                tokens=len(critical_positions),
+                seq_len=int(full_ids_cpu.shape[0]),
+                done_tok=processed_tokens_local,
+            )
 
         if cfg.mode == "exact_token_abs":
-            shifted_positions = [position - 1 for position in critical_positions]
-            target_ids = [int(full_ids[0, position].item()) for position in critical_positions]
+            if exact_token_grad_split:
+                # Keep only lightweight token ids on device, then run prefix-only
+                # forward passes token by token to bound graph size.
+                full_ids_device = full_ids_cpu.to(device, non_blocking=True)
+                for token_position in critical_positions:
+                    target_id = int(full_ids_cpu[int(token_position)].item())
+                    scalar_log_prob = _compute_exact_token_log_prob_with_prefix_forward(
+                        task_model=task_model,
+                        full_ids_device=full_ids_device,
+                        token_position=int(token_position),
+                        target_id=target_id,
+                        logits_keep_argument_name=logits_keep_argument_name,
+                    )
 
-            critical_logits = logits[0, shifted_positions, :].to(torch.float32)
-            critical_log_probs = torch.log_softmax(critical_logits, dim=-1)
+                    grads = torch.autograd.grad(
+                        scalar_log_prob,
+                        param_list,
+                        retain_graph=False,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
 
-            for token_idx in range(len(critical_positions)):
-                scalar_log_prob = critical_log_probs[token_idx, target_ids[token_idx]]
-                retain_graph = token_idx < (len(critical_positions) - 1)
+                    _accumulate_grads_to_importance_cpu(
+                        grads=grads,
+                        param_names=param_names,
+                        importance_cpu=importance_accum,
+                        abs_delta_cpu=abs_delta_cpu,
+                    )
+                    # Release graph-carrying tensors promptly.  Keeping
+                    # `scalar_log_prob` alive past this iteration can pin parts
+                    # of the autograd graph and make reserved CUDA memory climb.
+                    del grads
+                    del scalar_log_prob
 
+                    processed_tokens_local += 1
+                    token_pbar.update(1)
+                    if local_backprop_budget is not None and processed_tokens_local >= local_backprop_budget:
+                        hit_local_budget = True
+                        break
+            else:
+                full_ids = full_ids_cpu.to(device).unsqueeze(0)
+                outputs = task_model(input_ids=full_ids, use_cache=False)
+                logits = outputs.logits
+
+                for token_idx, token_position in enumerate(critical_positions):
+                    shifted_position = int(token_position) - 1
+                    target_id = int(full_ids[0, int(token_position)].item())
+                    token_logits_fp32 = logits[0, shifted_position, :].to(torch.float32)
+                    scalar_log_prob = _compute_target_log_prob_from_token_logits(
+                        token_logits_fp32=token_logits_fp32,
+                        target_id=target_id,
+                    )
+                    retain_graph = token_idx < (len(critical_positions) - 1)
+
+                    grads = torch.autograd.grad(
+                        scalar_log_prob,
+                        param_list,
+                        retain_graph=retain_graph,
+                        create_graph=False,
+                        allow_unused=True,
+                    )
+
+                    _accumulate_grads_to_importance_cpu(
+                        grads=grads,
+                        param_names=param_names,
+                        importance_cpu=importance_accum,
+                        abs_delta_cpu=abs_delta_cpu,
+                    )
+
+                    processed_tokens_local += 1
+                    token_pbar.update(1)
+                    # Drop per-token graph tensors before the next token.
+                    del grads
+                    del scalar_log_prob
+                    del token_logits_fp32
+
+                    if local_backprop_budget is not None and processed_tokens_local >= local_backprop_budget:
+                        hit_local_budget = True
+                        break
+
+                del outputs
+                del logits
+
+        elif cfg.mode == "sequence_sum_approx":
+            full_ids = full_ids_cpu.to(device).unsqueeze(0)
+
+            if use_split_forward:
+                # ── Memory-efficient split forward: body + selective head ──
+                # Problem: full model forward produces logits [1, seq_len, vocab]
+                #   (~7.2 GB bf16 for 24k×150k).  Worse, backward creates a
+                #   dense gradient for that tensor (~14.4 GB fp32).  Together
+                #   these consume ~22 GB just for logits + logits_grad.
+                #
+                # Solution: forward through the transformer body to get
+                #   hidden_states [1, seq_len, hidden_dim], then apply the LM
+                #   head (vocab projection) ONLY at critical positions.
+                #   Logits become [1, num_critical, vocab] (~600 MB for 2000
+                #   positions) and their gradient is proportionally smaller.
+                #   hidden_states gradient is [1, seq_len, hidden_dim] which
+                #   is tiny (hidden_dim=2048 vs vocab=150000, ~73x smaller).
+                #
+                # Memory savings: ~20 GB per sequence for 24k×150k.
+                body_output = transformer_body(
+                    input_ids=full_ids, use_cache=False,
+                )
+                # Extract hidden states — works with both dataclass and tuple
+                # outputs from HuggingFace transformer bodies.
+                if hasattr(body_output, "last_hidden_state"):
+                    hidden_states = body_output.last_hidden_state
+                elif isinstance(body_output, tuple):
+                    hidden_states = body_output[0]
+                else:
+                    hidden_states = body_output
+                del body_output
+
+                # Slice hidden states at critical positions (shifted by -1
+                # because logits at position t predict token at t+1).
+                critical_shifts = [p - 1 for p in critical_positions]
+                critical_hidden = hidden_states[:, critical_shifts, :]
+                del hidden_states  # Python ref freed; graph keeps data alive
+
+                # Apply LM head only to critical positions → small logits.
+                critical_logits = lm_head(critical_hidden)
+                del critical_hidden
+
+                # Compute per-position log-probs using the memory-efficient
+                # identity: log p(target) = logit[target] - logsumexp(logits).
+                scalar_terms: List[torch.Tensor] = []
+                for i, token_position in enumerate(critical_positions):
+                    target_id = int(full_ids[0, token_position].item())
+                    token_logits_fp32 = critical_logits[0, i, :].to(torch.float32)
+                    scalar_terms.append(
+                        _compute_target_log_prob_from_token_logits(
+                            token_logits_fp32=token_logits_fp32,
+                            target_id=target_id,
+                        )
+                    )
+                # Keep only scalar graph nodes; avoid carrying a trailing fp32
+                # token-logit tensor into the next sequence iteration.
+                del token_logits_fp32
+
+                summed_scalar = torch.stack(scalar_terms).sum()
                 grads = torch.autograd.grad(
-                    scalar_log_prob,
+                    summed_scalar,
                     param_list,
-                    retain_graph=retain_graph,
+                    retain_graph=False,
                     create_graph=False,
                     allow_unused=True,
                 )
 
-                for grad_index, grad in enumerate(grads):
-                    if grad is None:
-                        continue
-                    name = param_names[grad_index]
-                    if name in importance_gpu:
-                        grad_abs = grad.to(torch.float32).abs_()
-                        importance_gpu[name].add_(grad_abs.mul_(abs_delta_gpu[name]))
+                _accumulate_grads_to_importance_cpu(
+                    grads=grads,
+                    param_names=param_names,
+                    importance_cpu=importance_accum,
+                    abs_delta_cpu=abs_delta_cpu,
+                )
 
-                processed_tokens_local += 1
-                if local_backprop_budget is not None and processed_tokens_local >= local_backprop_budget:
-                    hit_local_budget = True
-                    break
+                processed_tokens_local += len(critical_positions)
+                token_pbar.update(len(critical_positions))
 
-        elif cfg.mode == "sequence_sum_approx":
-            log_probs = torch.log_softmax(logits[:, :-1, :].to(torch.float32), dim=-1)
-            scalar_terms: List[torch.Tensor] = []
-            for token_position in critical_positions:
-                shifted = token_position - 1
-                target_id = int(full_ids[0, token_position].item())
-                scalar_terms.append(log_probs[0, shifted, target_id])
+                # Eagerly release all GPU tensors.
+                del grads, summed_scalar, scalar_terms, critical_logits
 
-            summed_scalar = torch.stack(scalar_terms).sum()
-            grads = torch.autograd.grad(
-                summed_scalar,
-                param_list,
-                retain_graph=False,
-                create_graph=False,
-                allow_unused=True,
-            )
+            else:
+                # ── Fallback: full forward (if model structure unknown) ────
+                outputs = task_model(input_ids=full_ids, use_cache=False)
+                logits = outputs.logits
 
-            for grad_index, grad in enumerate(grads):
-                if grad is None:
-                    continue
-                name = param_names[grad_index]
-                if name in importance_gpu:
-                    grad_abs = grad.to(torch.float32).abs_()
-                    importance_gpu[name].add_(grad_abs.mul_(abs_delta_gpu[name]))
+                scalar_terms_fb: List[torch.Tensor] = []
+                for token_position in critical_positions:
+                    shifted = token_position - 1
+                    target_id = int(full_ids[0, token_position].item())
+                    token_logits_fp32 = logits[0, shifted, :].to(torch.float32)
+                    scalar_terms_fb.append(
+                        _compute_target_log_prob_from_token_logits(
+                            token_logits_fp32=token_logits_fp32,
+                            target_id=target_id,
+                        )
+                    )
+                # As above, free loop-local graph tensor immediately.
+                del token_logits_fp32
 
-            processed_tokens_local += len(critical_positions)
+                summed_scalar = torch.stack(scalar_terms_fb).sum()
+                grads = torch.autograd.grad(
+                    summed_scalar,
+                    param_list,
+                    retain_graph=False,
+                    create_graph=False,
+                    allow_unused=True,
+                )
+
+                _accumulate_grads_to_importance_cpu(
+                    grads=grads,
+                    param_names=param_names,
+                    importance_cpu=importance_accum,
+                    abs_delta_cpu=abs_delta_cpu,
+                )
+
+                processed_tokens_local += len(critical_positions)
+                token_pbar.update(len(critical_positions))
+
+                del grads, summed_scalar, scalar_terms_fb, outputs, logits
         else:
             raise ValueError(f"Unknown attribution mode: {cfg.mode}")
 
-        processed_sequences_local += 1
-        del outputs
-        del logits
+        # Free the GPU copy of input ids for this sequence.
+        if full_ids is not None:
+            del full_ids
+        if full_ids_device is not None:
+            del full_ids_device
 
-        if processed_sequences_local % 64 == 0:
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+        processed_sequences_local += 1
+
+        # ── GPU memory cleanup after every sequence ──────────────────────
+        # For long sequences (e.g. 24k tokens × 150k vocab), each forward
+        # pass allocates ~7+ GB of logits plus activations.  Without
+        # explicit cleanup, PyTorch's CUDA allocator retains freed blocks
+        # in its cache, causing GPU memory to climb monotonically even
+        # though the tensors are logically dead.
+        #
+        # Cleanup order matters:
+        #   1. zero_grad(set_to_none=True) — clear any .grad attributes that
+        #      autograd may have set on model parameters (e.g. through hooks
+        #      or internal bookkeeping).  set_to_none=True deallocates the
+        #      gradient tensors instead of zeroing them, reclaiming GPU RAM.
+        #   2. torch.cuda.synchronize() — CUDA ops are asynchronous; without
+        #      an explicit sync, freed GPU tensors may still appear "in-use"
+        #      to the caching allocator because the backward kernels haven't
+        #      finished yet.  Synchronizing guarantees all pending CUDA work
+        #      has completed so every freed block is reclaimable.
+        #   3. gc.collect() — break Python reference cycles that prevent
+        #      CUDA tensors from being released.
+        #   4. empty_cache() — return all cached CUDA blocks to the driver.
+        task_model.zero_grad(set_to_none=True)
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         if local_backprop_budget is not None and processed_tokens_local >= local_backprop_budget:
             hit_local_budget = True
+
+    # Close inner progress bar.
+    token_pbar.close()
 
     # Reduce counters globally for final metadata and normalization denominator.
     token_tensor = torch.tensor([processed_tokens_local], dtype=torch.int64, device=device)
@@ -773,15 +1321,24 @@ def compute_importance_scores_distributed(
     processed_tokens_global = int(token_tensor.item())
     processed_sequences_global = int(sequence_tensor.item())
 
-    # Reduce large importance tensors to rank 0 only.
-    for name in param_names:
-        if name not in importance_gpu:
-            continue
-        if context.distributed:
-            dist.reduce(importance_gpu[name], dst=0, op=dist.ReduceOp.SUM)
+    # ── Distributed reduction of importance tensors ──────────────────────
+    # Importance buffers live on CPU.  For NCCL reduction we temporarily
+    # move each tensor to GPU one at a time (only ~one parameter tensor's
+    # worth of VRAM at a time), reduce, then move back.
+    all_importance_names = sorted(importance_accum.keys())
+    if context.distributed:
+        for name in all_importance_names:
+            gpu_tensor = importance_accum[name].to(device)
+            dist.reduce(gpu_tensor, dst=0, op=dist.ReduceOp.SUM)
+            if context.rank == 0:
+                importance_accum[name] = gpu_tensor.cpu()
+            del gpu_tensor
+        # Free the temporary GPU allocation.
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if context.rank == 0:
-        importance_cpu = {name: tensor.cpu() for name, tensor in importance_gpu.items()}
+        importance_cpu = importance_accum
         if cfg.normalize_by_token_count and processed_tokens_global > 0:
             scale = float(processed_tokens_global)
             for name in importance_cpu.keys():
@@ -789,8 +1346,14 @@ def compute_importance_scores_distributed(
     else:
         importance_cpu = None
 
-    del abs_delta_gpu
-    del importance_gpu
+    # ── Cleanup: restore model state after attribution ──────────────────
+    if freeze_zero_delta and frozen_param_count > 0:
+        unfreeze_all_parameters(task_model)
+    if enable_gradient_checkpointing:
+        task_model.gradient_checkpointing_disable()
+
+    del abs_delta_cpu
+    del importance_accum
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -804,7 +1367,11 @@ def compute_importance_scores_distributed(
         "max_backprop_tokens_global": cfg.max_backprop_tokens,
         "max_backprop_tokens_local_budget": local_backprop_budget,
         "normalize_by_token_count": bool(cfg.normalize_by_token_count),
+        "exact_token_grad_split": bool(exact_token_grad_split),
+        "logits_keep_argument_name": logits_keep_argument_name,
         "world_size": int(context.world_size),
+        "frozen_param_count": int(frozen_param_count),
+        "gradient_checkpointing": bool(enable_gradient_checkpointing),
     }
     return importance_cpu, metadata
 
@@ -854,6 +1421,10 @@ def main() -> None:
             max_backprop_tokens=_int_to_optional_limit(int(args.max_backprop_tokens)),
             normalize_by_token_count=not bool(args.no_normalize_by_token_count),
         )
+        exact_token_grad_split = bool(args.exact_token_grad_split)
+        enable_gradient_checkpointing = bool(args.gradient_checkpointing)
+        freeze_zero_delta = bool(args.freeze_zero_delta_params)
+        attn_implementation = args.attn_implementation  # None or str
         validation_samples_per_task = _int_to_optional_limit(int(args.validation_samples_per_task))
 
         # Create output directories on rank 0 only, then synchronize.
@@ -872,6 +1443,12 @@ def main() -> None:
         rank_zero_print(context, f"Distributed context: rank={context.rank} world_size={context.world_size} device={context.device}")
         rank_zero_print(context, f"Output root: {runtime.output_root}")
         rank_zero_print(context, f"Selection modes: {selection_modes}, top_p={selection_template.top_p}")
+        rank_zero_print(
+            context,
+            f"Optimizations: attn={attn_implementation or 'default'}, "
+            f"grad_ckpt={enable_gradient_checkpointing}, "
+            f"freeze_zero_delta={freeze_zero_delta}",
+        )
 
         run_summary: Dict[str, Any] = {
             "created_at": now_iso(),
@@ -884,15 +1461,22 @@ def main() -> None:
             "selection_config_template": asdict(selection_template),
             "selection_modes": list(selection_modes),
             "attribution_config": asdict(attribution_cfg),
+            "exact_token_grad_split": bool(exact_token_grad_split),
+            "gradient_checkpointing": bool(enable_gradient_checkpointing),
+            "freeze_zero_delta": bool(freeze_zero_delta),
+            "attn_implementation": attn_implementation,
             "validation_samples_per_task": validation_samples_per_task,
             "task_specs": [asdict(task_spec) for task_spec in task_specs],
             "task_summaries": {},
         }
 
+        # Base model is used under torch.no_grad() for delta computation,
+        # but still benefits from flash attention during forward passes.
         base_model, _ = load_causal_lm(
             model_name_or_path=runtime.base_model_id,
             torch_dtype=runtime.model_dtype,
             device=runtime.device,
+            attn_implementation=attn_implementation,
         )
 
         for task_spec in task_specs:
@@ -937,6 +1521,7 @@ def main() -> None:
                 model_name_or_path=task_spec.model_path,
                 torch_dtype=runtime.model_dtype,
                 device=runtime.device,
+                attn_implementation=attn_implementation,
             )
 
             raw_rollout_df = pd.read_parquet(task_spec.fisher_correct_rollout_path)
@@ -959,6 +1544,12 @@ def main() -> None:
                     f"rank0_shard={len(shard_rollout_df) if context.rank == 0 else 'n/a'}"
                 ),
             )
+
+            # Ensure base_model is on GPU for delta logp collection.
+            # (It may have been offloaded to CPU in a previous task iteration.)
+            if next(base_model.parameters()).device.type == "cpu":
+                base_model.to(runtime.device)
+                rank_zero_print(context, f"  [memory] base_model moved back to GPU for delta collection")
 
             # Disable filtering in the collector because it was already applied globally.
             shard_collect_cfg = CriticalTokenConfig(
@@ -999,6 +1590,18 @@ def main() -> None:
                 base_model=base_model,
                 task_model=task_model,
             )
+
+            # ── Memory optimization: offload base_model to CPU ──────────
+            # Attribution only needs task_model for gradient computation.
+            # Moving base_model to CPU frees its GPU VRAM (~model_size × 2
+            # bytes for bf16), which is critical for long sequences.
+            # It will be moved back to GPU at the start of the next task
+            # iteration (for delta logp collection).
+            base_model.to("cpu")
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            rank_zero_print(context, f"  [memory] base_model offloaded to CPU for attribution")
 
             local_deltas = (
                 local_token_df["delta_logp"].to_numpy(dtype=np.float64)
@@ -1043,6 +1646,9 @@ def main() -> None:
                         cfg=attribution_cfg,
                         context=context,
                         device=runtime.device,
+                        exact_token_grad_split=exact_token_grad_split,
+                        enable_gradient_checkpointing=enable_gradient_checkpointing,
+                        freeze_zero_delta=freeze_zero_delta,
                     )
                 else:
                     # All ranks must still participate in distributed reduction path.
@@ -1054,6 +1660,9 @@ def main() -> None:
                         cfg=attribution_cfg,
                         context=context,
                         device=runtime.device,
+                        exact_token_grad_split=exact_token_grad_split,
+                        enable_gradient_checkpointing=enable_gradient_checkpointing,
+                        freeze_zero_delta=freeze_zero_delta,
                     )
 
                 mode_suffix = build_mode_suffix(mode=mode, top_p=selection_template.top_p)
