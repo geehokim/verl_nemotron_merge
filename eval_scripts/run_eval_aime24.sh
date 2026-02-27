@@ -58,17 +58,26 @@ MODEL_DIR_NAME="${MODEL_DIR_NAME:-$(parse_model_dir_from_path "${MODEL_PATH}")}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/ddn/vuvlm/geeho/nemotron_cascade_output}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${MODEL_DIR_NAME}/evaluation_output/aime24}"
 PROJECT_NAME="${PROJECT_NAME:-nemotron-cascade-parallel}"
-# Keep timestamp overridable so wrapper scripts can enforce one shared suffix
-# across multiple benchmark runs for the same model.
-TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-# Include parsed model directory in the default experiment name so logs are
-# self-descriptive even when multiple checkpoints are evaluated sequentially.
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-aime24-valonly-${MODEL_DIR_NAME}-${TIMESTAMP}}"
+
+# ----- Wandb experiment name construction -----
+# Format: {model}_{task}_{last_folder}
+# e.g., Qwen3-1.7B_aime24_actor  or  ties_merged_real_aime24
+# When MODEL_DIR_NAME equals the basename (merged model case), we skip the
+# redundant suffix to keep the name clean.
+TASK_LABEL="aime24"
+_BASENAME_OF_PATH="$(basename "${MODEL_PATH%/}")"
+if [[ "${MODEL_DIR_NAME}" == "${_BASENAME_OF_PATH}" ]]; then
+    # Merged model: MODEL_DIR_NAME already IS the last folder, no duplication
+    EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_DIR_NAME}_${TASK_LABEL}}"
+else
+    # Checkpoint model: MODEL_DIR_NAME differs from basename (e.g., Qwen3-1.7B vs actor)
+    EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_DIR_NAME}_${TASK_LABEL}_${_BASENAME_OF_PATH}}"
+fi
 
 # Cluster and precision parameters.
 NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
-ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-4}"
+ULYSSES_SEQUENCE_PARALLEL_SIZE="${ULYSSES_SEQUENCE_PARALLEL_SIZE:-1}"
 DTYPE="${DTYPE:-float16}"
 LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-sum-norm}"
 
@@ -110,12 +119,12 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.loss_agg_mode="${LOSS_AGG_MODE}" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.mode=async \
-    actor_rollout_ref.rollout.n=1 \
-    actor_rollout_ref.rollout.temperature=0.0 \
-    actor_rollout_ref.rollout.top_p=1.0 \
+    actor_rollout_ref.rollout.n=8 \
+    actor_rollout_ref.rollout.temperature=0.6 \
+    actor_rollout_ref.rollout.top_p=0.95 \
     actor_rollout_ref.rollout.top_k=-1 \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8 \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.9 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True \
@@ -123,11 +132,11 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.dtype="${DTYPE}" \
-    actor_rollout_ref.rollout.val_kwargs.temperature=0.0 \
-    actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+    actor_rollout_ref.rollout.val_kwargs.temperature=0.6 \
+    actor_rollout_ref.rollout.val_kwargs.top_p=0.95 \
     actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
-    actor_rollout_ref.rollout.val_kwargs.n=1 \
-    actor_rollout_ref.rollout.val_kwargs.do_sample=False \
+    actor_rollout_ref.rollout.val_kwargs.n=8 \
+    actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8 \
     actor_rollout_ref.ref.log_prob_use_dynamic_bsz=True \
     actor_rollout_ref.ref.fsdp_config.param_offload=True \

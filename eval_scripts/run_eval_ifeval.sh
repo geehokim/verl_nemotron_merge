@@ -58,12 +58,21 @@ MODEL_DIR_NAME="${MODEL_DIR_NAME:-$(parse_model_dir_from_path "${MODEL_PATH}")}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-/mnt/ddn/vuvlm/geeho/nemotron_cascade_output}"
 OUTPUT_DIR="${OUTPUT_DIR:-${OUTPUT_ROOT}/${MODEL_DIR_NAME}/evaluation_output/ifeval}"
 PROJECT_NAME="${PROJECT_NAME:-nemotron-cascade-parallel}"
-# Keep timestamp overridable so wrapper scripts can enforce one shared suffix
-# across multiple benchmark runs for the same model.
-TIMESTAMP="${TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
-# Include parsed model directory in the default experiment name so logs are
-# self-descriptive even when multiple checkpoints are evaluated sequentially.
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-ifeval-valonly-${MODEL_DIR_NAME}-${TIMESTAMP}}"
+
+# ----- Wandb experiment name construction -----
+# Format: {model}_{task}_{last_folder}
+# e.g., Qwen3-1.7B_ifeval_actor  or  ties_merged_real_ifeval
+# When MODEL_DIR_NAME equals the basename (merged model case), we skip the
+# redundant suffix to keep the name clean.
+TASK_LABEL="ifeval"
+_BASENAME_OF_PATH="$(basename "${MODEL_PATH%/}")"
+if [[ "${MODEL_DIR_NAME}" == "${_BASENAME_OF_PATH}" ]]; then
+    # Merged model: MODEL_DIR_NAME already IS the last folder, no duplication
+    EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_DIR_NAME}_${TASK_LABEL}}"
+else
+    # Checkpoint model: MODEL_DIR_NAME differs from basename (e.g., Qwen3-1.7B vs actor)
+    EXPERIMENT_NAME="${EXPERIMENT_NAME:-${MODEL_DIR_NAME}_${TASK_LABEL}_${_BASENAME_OF_PATH}}"
+fi
 
 # Cluster and generation parameters.
 NNODES="${NNODES:-1}"
