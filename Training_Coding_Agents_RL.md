@@ -41,6 +41,16 @@ This pipeline performs **GRPO-based reinforcement learning** on a coding task, f
 
 ## 3. Environment Setup
 
+### Clone the repository
+
+Grab the code and switch to the `rl-merging` branch — that is where the coding-RL pipeline lives:
+
+```bash
+git clone https://github.com/geehokim/verl_nemotron_merge.git
+cd verl_nemotron_merge
+git checkout rl-merging
+```
+
 ### Option A — Docker (recommended)
 
 ```bash
