@@ -45,10 +45,10 @@ BASE_MODEL="Qwen/Qwen3-1.7B"
 
 WORLD_SIZE=1
 MACHINE_GPU_COUNT=8
-SAVE_FREQ=50
+SAVE_FREQ=20
 DTYPE=float16
 LOSS_AGG_MODE=seq-mean-token-sum-norm
-VAL_ROLLOUT_N=1
+VAL_ROLLOUT_N=8
 TOTAL_EPOCHS=1
 # Nemotron paper: 200 optimizer steps for Code RL.
 TOTAL_TRAINING_STEPS=200
@@ -192,8 +192,8 @@ COMMON_ARGS=(
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}"
-    actor_rollout_ref.actor.use_kl_loss=False
-    actor_rollout_ref.actor.kl_loss_coef=0.0
+    actor_rollout_ref.actor.use_kl_loss=True
+    actor_rollout_ref.actor.kl_loss_coef=0.002
     actor_rollout_ref.actor.entropy_coeff=0.0
     actor_rollout_ref.model.enable_gradient_checkpointing=True
 
