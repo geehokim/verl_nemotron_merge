@@ -27,6 +27,7 @@ When working with Megatron:
 """
 
 import getpass
+import inspect
 import logging
 import os
 from dataclasses import asdict
@@ -46,10 +47,15 @@ from vllm.config import LoRAConfig
 from verl.utils.ray_utils import get_event_loop
 
 try:
-    from vllm.worker.worker_base import WorkerWrapperBase
-except ModuleNotFoundError:
-    # https://github.com/vllm-project/vllm/commit/6a113d9aed8221a9c234535958e70e34ab6cac5b
+    # Prefer v1 worker wrapper when available.
     from vllm.v1.worker.worker_base import WorkerWrapperBase
+except (ModuleNotFoundError, ImportError):
+    from vllm.worker.worker_base import WorkerWrapperBase
+except ImportError as import_error:
+    # vLLM 0.11 can expose v1.worker.worker_base without WorkerWrapperBase.
+    if "WorkerWrapperBase" not in str(import_error):
+        raise
+    from vllm.worker.worker_base import WorkerWrapperBase
 
 from packaging import version as vs
 
@@ -81,6 +87,21 @@ logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 if is_version_ge(pkg="vllm", minver="0.7.3"):
     VLLMHijack.hijack()
+
+
+def _build_worker_wrapper(vllm_config):
+    """Build WorkerWrapperBase compatible with multiple vLLM API versions."""
+    try:
+        init_params = inspect.signature(WorkerWrapperBase.__init__).parameters
+    except Exception:
+        init_params = {}
+
+    # Newer vLLM expects vllm_config in ctor.
+    if "vllm_config" in init_params:
+        return WorkerWrapperBase(vllm_config=vllm_config)
+
+    # Legacy vLLM initializes wrapper without ctor config.
+    return WorkerWrapperBase()
 
 
 def _check_vllm_version_for_sleep_level():
@@ -202,7 +223,7 @@ class vLLMAsyncRollout(BaseRollout):
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
 
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine = _build_worker_wrapper(self.vllm_config)
         self.inference_engine.init_worker(all_kwargs)
 
     def _load_model(self, *args, **kwargs):

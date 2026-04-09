@@ -32,30 +32,13 @@ export PYTHONWARNINGS="ignore::UserWarning:megatron"
 # =============================================================================
 
 source /home/nsml/verl/bin/activate
-python -m wandb login 733bd860c7324e3d31ada0288891ee6f19d42c38
-
+export WANDB_API_KEY="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"
 
 export TRANSFORMERS_VERBOSITY=error
 
-export XDG_CACHE_HOME=/mnt/tmp/nsml/cache
-export PIP_CACHE_DIR=/mnt/tmp/nsml/pip-cache
-
-export HF_HOME=/mnt/tmp/nsml/huggingface
-export TRANSFORMERS_CACHE=/mnt/tmp/nsml/huggingface/hub
-export HF_DATASETS_CACHE=/mnt/tmp/nsml/huggingface/datasets
-
-export TORCH_HOME=/mnt/tmp/nsml/torch
-export TRITON_CACHE_DIR=/mnt/tmp/nsml/triton
-export TORCHINDUCTOR_CACHE_DIR=/mnt/tmp/nsml/torchinductor
-
-export CUDA_CACHE_PATH=/mnt/tmp/nsml/cuda-cache
-export TMPDIR=/mnt/tmp/nsml/tmp
-
 export VLLM_LOGGING_LEVEL=DEBUG
 
-
-export WANDB_API_KEY="733bd860c7324e3d31ada0288891ee6f19d42c38"
-export PYTHONPATH="/mnt/ddn/vuvlm/geeho/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="/home2/geeho/tmp/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
 
 # =============================================================================
 # Configuration

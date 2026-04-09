@@ -1,34 +1,30 @@
 #!/bin/bash
-# IFEval RL training (Qwen3-1.7B) with:
-# - preflight IFEval JSONL -> VERL parquet conversion (train/val split)
-# - custom reward based on evaluation/eval/get_scores_ifeval.py logic
-# - in-training periodic validation on IFEval val parquet
+# Coding RL training (Qwen3-1.7B) with:
+# - preflight automatic train parquet compatibility conversion
+# - LiveBench-only validation
+# - coding custom reward routed through evaluation/eval/verl_custom_reward.py
 
 set -x
 set -e
 export PYTHONWARNINGS="ignore::UserWarning:megatron"
 
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 
-if [ -f /home/nsml/verl/bin/activate ]; then
-    source /home/nsml/verl/bin/activate
-fi
-
-# Ensure IFEval reward dependencies + parquet tooling are available.
+# Ensure runtime dependencies used by coding converter/reward are available.
 python - <<'PY'
 import importlib
 import subprocess
 import sys
 
-required = {
-    "langdetect": "langdetect",
-    "immutabledict": "immutabledict",
-    "nltk": "nltk",
+required_pip = {
     "pyarrow": "pyarrow",
+    "numpy": "numpy",
+    "ftlangdetect": "fasttext-langdetect",
 }
 missing = []
-for module_name, pip_name in required.items():
+for module_name, pip_name in required_pip.items():
     try:
         importlib.import_module(module_name)
     except Exception:
@@ -36,23 +32,15 @@ for module_name, pip_name in required.items():
 
 if missing:
     subprocess.check_call([sys.executable, "-m", "pip", "install", *sorted(set(missing))])
-
-import nltk
-
-resources = [("tokenizers/punkt", "punkt"), ("tokenizers/punkt_tab", "punkt_tab")]
-for path, pkg in resources:
-    try:
-        nltk.data.find(path)
-    except Exception:
-        nltk.download(pkg, quiet=True)
 PY
 
+export WANDB_API_KEY="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"
 export TRANSFORMERS_VERBOSITY=error
 export VLLM_LOGGING_LEVEL=DEBUG
-export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PYTHONPATH="/home2/geeho/tmp/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
 
-PROJECT_NAME="nemotron-cascade-ifrl"
-OUTPUT_DIR="/131_data/geeho/nemotron_cascade_output/Qwen3-1.7B-ifrl_ifeval"
+PROJECT_NAME="nemotron-cascade-coding"
+OUTPUT_DIR="/131_data/geeho/nemotron_cascade_output/Qwen3-1.7B-coding"
 BASE_MODEL="Qwen/Qwen3-1.7B"
 
 WORLD_SIZE=1
@@ -60,90 +48,136 @@ MACHINE_GPU_COUNT=8
 SAVE_FREQ=50
 DTYPE=float16
 LOSS_AGG_MODE=seq-mean-token-sum-norm
-VAL_ROLLOUT_N=2
+VAL_ROLLOUT_N=1
 TOTAL_EPOCHS=1
+# Nemotron paper: 200 optimizer steps for Code RL.
+TOTAL_TRAINING_STEPS=200
 VAL_ONLY=false
 
+# Smoke mode for low-resource bring-up (e.g., 2xA5000).
+# Usage: SMOKE_MODE=true bash run_qwen3_1.7b_coding.sh
 SMOKE_MODE="${SMOKE_MODE:-false}"
-IFEVAL_VAL_SAMPLES="${IFEVAL_VAL_SAMPLES:-256}"
 
-TRAIN_BATCH_SIZE=256
-VAL_BATCH_SIZE=256
-MAX_RESPONSE_LENGTH=8192
-PPO_MINI_BATCH_SIZE=256
-PPO_MICRO_BATCH_SIZE_PER_GPU=128
+TRAIN_BATCH_SIZE=128
+VAL_BATCH_SIZE=64
+# Kept at 32k here for Qwen3-1.7B
+# on this hardware; revisit if scaling up the model or GPU count.
+MAX_RESPONSE_LENGTH=32768
+PPO_MINI_BATCH_SIZE=128
+PPO_MICRO_BATCH_SIZE_PER_GPU=64
 ROLLOUT_N=8
 ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=16
-ROLLOUT_GPU_MEMORY_UTILIZATION=0.9
+ROLLOUT_GPU_MEMORY_UTILIZATION=0.90
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=34816
 ULYSSES_SEQUENCE_PARALLEL_SIZE=4
 TEST_FREQ=10
 TRAIN_MAX_SAMPLES=-1
-VAL_MAX_SAMPLES=-1
+VAL_MAX_SAMPLES=32
+# agent_loop chunks the gen batch across num_workers; must divide evenly.
+AGENT_NUM_WORKERS=8
 
 if [ "${SMOKE_MODE}" = "true" ]; then
-    MACHINE_GPU_COUNT=2
-    TRAIN_BATCH_SIZE=8
-    VAL_BATCH_SIZE=8
+    MACHINE_GPU_COUNT=4
+    TRAIN_BATCH_SIZE=4
+    VAL_BATCH_SIZE=4
     MAX_RESPONSE_LENGTH=2048
-    PPO_MINI_BATCH_SIZE=8
-    PPO_MICRO_BATCH_SIZE_PER_GPU=8
-    ROLLOUT_N=2
+    PPO_MINI_BATCH_SIZE=4
+    PPO_MICRO_BATCH_SIZE_PER_GPU=4
+    ROLLOUT_N=1
     ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
     ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192
-    ULYSSES_SEQUENCE_PARALLEL_SIZE=2
+    ULYSSES_SEQUENCE_PARALLEL_SIZE=4
     TEST_FREQ=5
-    TRAIN_MAX_SAMPLES=128
-    VAL_MAX_SAMPLES=64
+    TRAIN_MAX_SAMPLES=64
+    VAL_MAX_SAMPLES=32
     SAVE_FREQ=10
+    AGENT_NUM_WORKERS=1
 fi
 
-EXPERIMENT_NAME="qwen3-1.7b-ifrl-ifeval"
+EXPERIMENT_NAME="qwen3-1.7b-ifrl-coding-livebench"
 if [ "${SMOKE_MODE}" = "true" ]; then
     EXPERIMENT_NAME="${EXPERIMENT_NAME}-smoke2gpu"
 fi
 
 echo "SMOKE_MODE=${SMOKE_MODE}"
-echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}, VAL_BATCH_SIZE=${VAL_BATCH_SIZE}"
-echo "TEST_FREQ=${TEST_FREQ}, TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES}, VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES}"
+echo "MACHINE_GPU_COUNT=${MACHINE_GPU_COUNT}, TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}, VAL_BATCH_SIZE=${VAL_BATCH_SIZE}"
+echo "ROLLOUT_N=${ROLLOUT_N}, MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH}, ULYSSES_SP=${ULYSSES_SEQUENCE_PARALLEL_SIZE}"
+echo "TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES}, VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES}"
 
-IFEVAL_INPUT_JSONL="${REPO_ROOT}/evaluation/data/ifeval/input_data.jsonl"
-IFEVAL_TRAIN_PARQUET="${REPO_ROOT}/evaluation/data/ifeval/train_verl_ready.parquet"
-IFEVAL_VAL_PARQUET="${REPO_ROOT}/evaluation/data/ifeval/val_verl_ready.parquet"
-IFEVAL_CACHE_MANIFEST="${REPO_ROOT}/evaluation/data/ifeval/ifeval_conversion_cache.json"
-IFEVAL_CONVERTER="${REPO_ROOT}/evaluation/data/ifeval/convert_ifeval_to_verl_parquet.py"
+DATASET_ROOT="${DATASET_ROOT:-/131_data/geeho/data/Nemotron-RL-coding-competitive_coding}"
+TRAIN_PARQUET_DIR="${TRAIN_PARQUET_DIR:-${DATASET_ROOT}/data}"
+TRAIN_CONVERTER="${REPO_ROOT}/evaluation/data/coding/ensure_competitive_coding_verl_parquet.py"
+TRAIN_CONVERTED_DIR="${DATASET_ROOT}/verl_coding_cache"
+TRAIN_MANIFEST="${DATASET_ROOT}/train_files_manifest.json"
+
+LIVEBENCH_JSON="${REPO_ROOT}/evaluation/data/livebench/LiveBench.json"
+LIVEBENCH_CONVERTER="${REPO_ROOT}/evaluation/data/livebench/convert_livebench_to_verl_parquet.py"
+LIVEBENCH_VAL_PARQUET="${REPO_ROOT}/evaluation/data/livebench/livebench_verl_ready.parquet"
+
 CUSTOM_REWARD_FN="${REPO_ROOT}/evaluation/eval/verl_custom_reward.py"
 
-if [ ! -f "${IFEVAL_INPUT_JSONL}" ]; then
-    echo "Missing IFEval input JSONL: ${IFEVAL_INPUT_JSONL}"
-    exit 1
-fi
-if [ ! -f "${IFEVAL_CONVERTER}" ]; then
-    echo "Missing IFEval converter: ${IFEVAL_CONVERTER}"
-    exit 1
-fi
 if [ ! -f "${CUSTOM_REWARD_FN}" ]; then
     echo "Missing custom reward function file: ${CUSTOM_REWARD_FN}"
     exit 1
 fi
 
-# Preflight: build or reuse cached train/val parquet for IFEval.
-python "${IFEVAL_CONVERTER}" \
-    --input_jsonl "${IFEVAL_INPUT_JSONL}" \
-    --output_train_parquet "${IFEVAL_TRAIN_PARQUET}" \
-    --output_val_parquet "${IFEVAL_VAL_PARQUET}" \
-    --cache_manifest "${IFEVAL_CACHE_MANIFEST}" \
-    --val_samples "${IFEVAL_VAL_SAMPLES}" \
-    --seed 42 \
-    --data_source_train nemotron_cascade_rl_if \
-    --data_source_val nemotron_cascade_rl_if \
+if [ ! -f "${TRAIN_CONVERTER}" ]; then
+    echo "Missing train converter: ${TRAIN_CONVERTER}"
+    exit 1
+fi
+
+if [ ! -f "${LIVEBENCH_CONVERTER}" ]; then
+    echo "Missing LiveBench converter: ${LIVEBENCH_CONVERTER}"
+    exit 1
+fi
+
+if [ ! -d "${DATASET_ROOT}/data" ]; then
+    echo "Missing train parquet directory: ${DATASET_ROOT}/data"
+    exit 1
+fi
+
+if ! compgen -G "${DATASET_ROOT}/data/*.parquet" > /dev/null; then
+    echo "No parquet files found in train parquet directory: ${DATASET_ROOT}/data"
+    exit 1
+fi
+
+# Preflight: convert training data shards only when source is not VERL-compatible.
+python "${TRAIN_CONVERTER}" \
+    --input_dir "${DATASET_ROOT}/data" \
+    --output_dir "${TRAIN_CONVERTED_DIR}" \
+    --manifest_path "${TRAIN_MANIFEST}" \
+    --data_source nemotron_cascade_rl_coding \
+    --split train
+
+# Preflight: build LiveBench validation parquet.
+python "${LIVEBENCH_CONVERTER}" \
+    --input_json "${LIVEBENCH_JSON}" \
+    --output_parquet "${LIVEBENCH_VAL_PARQUET}" \
+    --data_source livebench/coding \
+    --split test \
     --prompt_language en
+
+TRAIN_FILES_HYDRA=$(python - <<PY
+import json
+from pathlib import Path
+manifest = Path("${TRAIN_MANIFEST}")
+if not manifest.exists():
+    raise FileNotFoundError(f"train manifest not found: {manifest}")
+data = json.loads(manifest.read_text(encoding="utf-8"))
+train_files = data.get("train_files", [])
+if not train_files:
+    raise RuntimeError(
+        f"empty train_files in manifest: {manifest}\\nmode={data.get('mode')}"
+    )
+print("[" + ",".join(f"'{p}'" for p in train_files) + "]")
+PY
+)
 
 COMMON_ARGS=(
     algorithm.adv_estimator=grpo
-    data.train_files="${IFEVAL_TRAIN_PARQUET}"
-    data.val_files="${IFEVAL_VAL_PARQUET}"
+    data.train_files="${TRAIN_FILES_HYDRA}"
+    data.val_files="${LIVEBENCH_VAL_PARQUET}"
     data.train_batch_size="${TRAIN_BATCH_SIZE}"
     data.val_batch_size="${VAL_BATCH_SIZE}"
     data.max_prompt_length=2048
@@ -165,9 +199,11 @@ COMMON_ARGS=(
 
     actor_rollout_ref.rollout.name=vllm
     actor_rollout_ref.rollout.n="${ROLLOUT_N}"
-    actor_rollout_ref.rollout.temperature=0.6
-    actor_rollout_ref.rollout.top_p=0.95
-    actor_rollout_ref.rollout.top_k=20
+    # Train rollout: unconstrained sampling (Nemotron-style), only temperature set.
+    actor_rollout_ref.rollout.temperature=1.0
+    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.top_k=-1
+    actor_rollout_ref.rollout.agent.num_workers="${AGENT_NUM_WORKERS}"
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU}"
     actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}"
     actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
@@ -178,7 +214,7 @@ COMMON_ARGS=(
     actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU}"
     algorithm.use_kl_in_reward=False
 
-    reward_manager.name=naive
+    reward_manager.name=prime
     reward_manager.source=register
     custom_reward_function.path="${CUSTOM_REWARD_FN}"
     custom_reward_function.name=compute_score
@@ -188,11 +224,10 @@ COMMON_ARGS=(
     trainer.n_gpus_per_node="${MACHINE_GPU_COUNT}"
     trainer.nnodes="${WORLD_SIZE}"
     trainer.test_freq="${TEST_FREQ}"
-    trainer.val_before_train=True
+    trainer.val_before_train=False
     trainer.val_only="${VAL_ONLY}"
     trainer.resume_mode=auto
     trainer.save_freq="${SAVE_FREQ}"
-    trainer.validation_data_dir="${OUTPUT_DIR}/validation_outputs"
     actor_rollout_ref.actor.checkpoint.save_contents=['hf_model','model']
 
     actor_rollout_ref.actor.fsdp_config.param_offload=True
@@ -205,11 +240,14 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.ulysses_sequence_parallel_size="${ULYSSES_SEQUENCE_PARALLEL_SIZE}"
     actor_rollout_ref.ref.ulysses_sequence_parallel_size="${ULYSSES_SEQUENCE_PARALLEL_SIZE}"
 
+    # Validation sampling: Qwen3 Thinking recommended defaults.
     actor_rollout_ref.rollout.val_kwargs.temperature=0.6
     actor_rollout_ref.rollout.val_kwargs.top_p=0.95
     actor_rollout_ref.rollout.val_kwargs.top_k=20
     actor_rollout_ref.rollout.val_kwargs.n="${VAL_ROLLOUT_N}"
     actor_rollout_ref.rollout.val_kwargs.do_sample=True
+
+    +data.apply_chat_template_kwargs.enable_thinking=True
 
     actor_rollout_ref.model.trust_remote_code=True
     actor_rollout_ref.actor.fsdp_config.dtype="${DTYPE}"
@@ -223,4 +261,5 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
     +reward_model.reward_kwargs.overlong_filtering=False \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
+    trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
     trainer.default_local_dir="${OUTPUT_DIR}"

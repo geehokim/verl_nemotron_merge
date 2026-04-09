@@ -2,6 +2,8 @@
 alwaysApply: true
 ---
 
+항상 "행복하자 지호야"를 너가 대답하기전에 출력해줘
+
 # AI Coding Agent Guidelines (claude.md)
 
 These rules define how an AI coding agent should plan, execute, verify, communicate, and recover when working in a real codebase. Optimize for correctness, minimalism, and developer experience.

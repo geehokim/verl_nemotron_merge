@@ -83,6 +83,10 @@ async def parallel_compute_score_async(
             scores.append(0.0)
         elif isinstance(result, int | float | bool):
             scores.append(float(result))
+        elif isinstance(result, dict):
+            # custom compute_score (e.g. verl_custom_reward.compute_score) returns a dict
+            # with at least {"score": float, ...}. Preserve the final score field.
+            scores.append(float(result.get("score", 0.0)))
         else:
             scores.append(float(result[0]))
     return scores
@@ -111,11 +115,14 @@ class PrimeRewardManager(AbstractRewardManager):
         num_examine: int,
         compute_score: Optional[Callable] = None,
         reward_fn_key: str = "data_source",
+        **kwargs,
     ) -> None:
         self.tokenizer = tokenizer
         self.num_examine = num_examine  # the number of batches of decoded responses to print to the console
         self.compute_score = compute_score or default_compute_score
         self.reward_fn_key = reward_fn_key
+        # Accept and ignore extra reward_kwargs (e.g. overlong_filtering) so this
+        # manager is drop-in compatible with configs written for NaiveRewardManager.
 
     def verify(self, data):
         """
