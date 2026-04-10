@@ -39,8 +39,8 @@ export TRANSFORMERS_VERBOSITY=error
 export VLLM_LOGGING_LEVEL=DEBUG
 export PYTHONPATH="/home2/geeho/tmp/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
 
-PROJECT_NAME="nemotron-cascade-coding"
-OUTPUT_DIR="/131_data/geeho/nemotron_cascade_output/Qwen3-1.7B-coding"
+PROJECT_NAME="rl_merging"
+OUTPUT_DIR="/131_data/geeho/rl_merging_output/Qwen3-1.7B-coding"
 BASE_MODEL="Qwen/Qwen3-1.7B"
 
 WORLD_SIZE=1
