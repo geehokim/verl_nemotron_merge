@@ -339,7 +339,11 @@ def _normalize_ifeval_ground_truth(
         raise ValueError("IFEval ground_truth must include non-empty prompt")
 
     instruction_id_list = payload.get("instruction_id_list", [])
-    if not isinstance(instruction_id_list, list) or not instruction_id_list:
+    if hasattr(instruction_id_list, "tolist"):
+        instruction_id_list = instruction_id_list.tolist()
+    if not isinstance(instruction_id_list, list):
+        instruction_id_list = list(instruction_id_list) if instruction_id_list else []
+    if not instruction_id_list:
         raise ValueError("IFEval ground_truth must include non-empty instruction_id_list")
     instruction_id_list = [_as_str(x).strip() for x in instruction_id_list if _as_str(x).strip()]
     if not instruction_id_list:
@@ -349,12 +353,17 @@ def _normalize_ifeval_ground_truth(
     if isinstance(kwargs, str):
         parsed_kwargs = _safe_json_loads(kwargs)
         kwargs = parsed_kwargs if isinstance(parsed_kwargs, list) else []
+    if hasattr(kwargs, "tolist"):
+        kwargs = kwargs.tolist()
     if not isinstance(kwargs, list):
-        kwargs = []
+        kwargs = list(kwargs) if kwargs else []
 
     normalized_kwargs: list[dict[str, Any]] = []
     for value in kwargs[: len(instruction_id_list)]:
-        normalized_kwargs.append(value if isinstance(value, dict) else {})
+        if isinstance(value, dict):
+            normalized_kwargs.append({k: v for k, v in value.items() if v is not None})
+        else:
+            normalized_kwargs.append({})
     if len(normalized_kwargs) < len(instruction_id_list):
         normalized_kwargs.extend({} for _ in range(len(instruction_id_list) - len(normalized_kwargs)))
 

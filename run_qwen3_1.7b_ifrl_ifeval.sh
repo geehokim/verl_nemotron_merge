@@ -60,12 +60,11 @@ MACHINE_GPU_COUNT=8
 SAVE_FREQ=50
 DTYPE=float16
 LOSS_AGG_MODE=seq-mean-token-sum-norm
-VAL_ROLLOUT_N=2
+VAL_ROLLOUT_N=8
 TOTAL_EPOCHS=1
 VAL_ONLY=false
 
 SMOKE_MODE="${SMOKE_MODE:-false}"
-IFEVAL_VAL_SAMPLES="${IFEVAL_VAL_SAMPLES:-256}"
 
 TRAIN_BATCH_SIZE=256
 VAL_BATCH_SIZE=256
@@ -82,20 +81,20 @@ TRAIN_MAX_SAMPLES=-1
 VAL_MAX_SAMPLES=-1
 
 if [ "${SMOKE_MODE}" = "true" ]; then
-    MACHINE_GPU_COUNT=2
-    TRAIN_BATCH_SIZE=8
-    VAL_BATCH_SIZE=8
+    MACHINE_GPU_COUNT=4
+    TRAIN_BATCH_SIZE=4
+    VAL_BATCH_SIZE=4
     MAX_RESPONSE_LENGTH=2048
-    PPO_MINI_BATCH_SIZE=8
-    PPO_MICRO_BATCH_SIZE_PER_GPU=8
+    PPO_MINI_BATCH_SIZE=4
+    PPO_MICRO_BATCH_SIZE_PER_GPU=4
     ROLLOUT_N=2
     ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
-    ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
+    ROLLOUT_GPU_MEMORY_UTILIZATION=0.8
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192
-    ULYSSES_SEQUENCE_PARALLEL_SIZE=2
+    ULYSSES_SEQUENCE_PARALLEL_SIZE=4
     TEST_FREQ=5
     TRAIN_MAX_SAMPLES=128
-    VAL_MAX_SAMPLES=64
+    VAL_MAX_SAMPLES=16
     SAVE_FREQ=10
 fi
 
@@ -108,15 +107,19 @@ echo "SMOKE_MODE=${SMOKE_MODE}"
 echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}, VAL_BATCH_SIZE=${VAL_BATCH_SIZE}"
 echo "TEST_FREQ=${TEST_FREQ}, TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES}, VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES}"
 
-IFEVAL_INPUT_JSONL="${REPO_ROOT}/evaluation/data/ifeval/input_data.jsonl"
-IFEVAL_TRAIN_PARQUET="${REPO_ROOT}/evaluation/data/ifeval/train_verl_ready.parquet"
-IFEVAL_VAL_PARQUET="${REPO_ROOT}/evaluation/data/ifeval/val_verl_ready.parquet"
-IFEVAL_CACHE_MANIFEST="${REPO_ROOT}/evaluation/data/ifeval/ifeval_conversion_cache.json"
+# --- IFEVAL Training Data (external dataset, data_source="if") ---
+IFEVAL_DATASET_ROOT="${IFEVAL_DATASET_ROOT:-/131_data/geeho/data/Nemotron-Cascade-RL-Instruction-Following}"
+IFEVAL_TRAIN_PARQUET="${IFEVAL_DATASET_ROOT}/ifrl_if_verl_ready.parquet"
+
+# --- IFEVAL Validation Data (converted from input_data.jsonl) ---
+IFEVAL_JSON="${REPO_ROOT}/evaluation/data/ifeval/input_data.jsonl"
 IFEVAL_CONVERTER="${REPO_ROOT}/evaluation/data/ifeval/convert_ifeval_to_verl_parquet.py"
+IFEVAL_VAL_PARQUET="${REPO_ROOT}/evaluation/data/ifeval/input_data_verl_ready.parquet"
+
 CUSTOM_REWARD_FN="${REPO_ROOT}/evaluation/eval/verl_custom_reward.py"
 
-if [ ! -f "${IFEVAL_INPUT_JSONL}" ]; then
-    echo "Missing IFEval input JSONL: ${IFEVAL_INPUT_JSONL}"
+if [ ! -f "${IFEVAL_TRAIN_PARQUET}" ]; then
+    echo "Missing IFEVAL training parquet: ${IFEVAL_TRAIN_PARQUET}"
     exit 1
 fi
 if [ ! -f "${IFEVAL_CONVERTER}" ]; then
@@ -128,17 +131,19 @@ if [ ! -f "${CUSTOM_REWARD_FN}" ]; then
     exit 1
 fi
 
-# Preflight: build or reuse cached train/val parquet for IFEval.
-python "${IFEVAL_CONVERTER}" \
-    --input_jsonl "${IFEVAL_INPUT_JSONL}" \
-    --output_train_parquet "${IFEVAL_TRAIN_PARQUET}" \
-    --output_val_parquet "${IFEVAL_VAL_PARQUET}" \
-    --cache_manifest "${IFEVAL_CACHE_MANIFEST}" \
-    --val_samples "${IFEVAL_VAL_SAMPLES}" \
-    --seed 42 \
-    --data_source_train nemotron_cascade_rl_if \
-    --data_source_val nemotron_cascade_rl_if \
-    --prompt_language en
+# Preflight: build IFEVAL validation parquet (skip if already exists).
+if [ ! -f "${IFEVAL_VAL_PARQUET}" ]; then
+    if [ ! -f "${IFEVAL_JSON}" ]; then
+        echo "Missing IFEVAL input JSONL: ${IFEVAL_JSON}"
+        exit 1
+    fi
+    python "${IFEVAL_CONVERTER}" \
+        --input_jsonl "${IFEVAL_JSON}" \
+        --output_parquet "${IFEVAL_VAL_PARQUET}" \
+        --data_source ifeval \
+        --split test \
+        --prompt_language en
+fi
 
 COMMON_ARGS=(
     algorithm.adv_estimator=grpo
