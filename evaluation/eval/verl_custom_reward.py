@@ -425,6 +425,11 @@ def _compute_coding_score(
         "code_switching_penalty": float(code_switching_penalty),
         "timeout": int(timeout),
         "num_tests": int(gt["num_tests"]),
+        # Match the key set returned by the math reward so joint multi-task
+        # batches don't produce object-dtype arrays with None entries in
+        # downstream trainer hooks (e.g. the overlong-filter skip_mask).
+        "skip": False,
+        "overlong": False,
     }
 
 
@@ -456,6 +461,16 @@ def _compute_ifeval_score(
     strict_instruction_acc = _safe_mean_bools(strict_follow_list)
     loose_instruction_acc = _safe_mean_bools(loose_follow_list)
 
+    # NOTE: do not return the raw per-instruction boolean lists
+    # (``strict_follow_instruction_list`` / ``loose_follow_instruction_list``).
+    # Their length is the prompt's instruction count, which varies across
+    # samples, so they crash the batched np.array stacking in
+    # agent_loop._postprocess (inhomogeneous shape). The scalar
+    # ``strict_instruction_accuracy`` already captures the same signal.
+    # Also return ``skip``/``overlong`` with default False so the key set
+    # matches math/coding in joint training — the trainer's overlong-filter
+    # hook reads this field and errors out if it's missing from some samples
+    # (object-dtype with None entries).
     return {
         "score": float(1.0 if strict_follow_all else 0.0),
         "acc": bool(strict_follow_all),
@@ -464,9 +479,9 @@ def _compute_ifeval_score(
         "loose_follow_all": bool(loose_follow_all),
         "strict_instruction_accuracy": float(strict_instruction_acc),
         "loose_instruction_accuracy": float(loose_instruction_acc),
-        "strict_follow_instruction_list": strict_follow_list,
-        "loose_follow_instruction_list": loose_follow_list,
         "instruction_count": int(len(strict_follow_list)),
+        "skip": False,
+        "overlong": False,
     }
 
 
@@ -495,6 +510,8 @@ def compute_score(
                 "strict_instruction_accuracy": 0.0,
                 "loose_instruction_accuracy": 0.0,
                 "instruction_count": 0,
+                "skip": False,
+                "overlong": False,
                 "error": str(exc),
             }
 
@@ -514,6 +531,8 @@ def compute_score(
                 "answer_reward": 0.0,
                 "code_switching": False,
                 "code_switching_penalty": 0.0,
+                "skip": False,
+                "overlong": False,
                 "error": str(exc),
             }
 

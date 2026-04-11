@@ -639,10 +639,33 @@ class AgentLoopWorkerBase:
         }
 
         # add reward_extra_info to non_tensor_batch
+        #
+        # Two robustness fixes for multi-task joint training:
+        #   (a) Keys can differ across samples when a batch mixes task types
+        #       (e.g. IF vs coding vs math all use `compute_score` dispatch but
+        #       each returns a different dict shape). Take the union of keys
+        #       and fill missing entries with None so no task is dropped.
+        #   (b) Values for a given key can have inhomogeneous shape across
+        #       samples — IFEval returns per-instruction boolean lists whose
+        #       length equals the prompt's instruction count, which varies.
+        #       np.array(...) then fails with "inhomogeneous shape". Fall back
+        #       to an object-dtype array in that case.
         reward_extra_infos = [input.extra_fields.get("reward_extra_info", {}) for input in inputs]
-        reward_extra_keys = list(reward_extra_infos[0].keys())
+        reward_extra_keys: list[str] = []
+        _seen: set[str] = set()
+        for info in reward_extra_infos:
+            for k in info.keys():
+                if k not in _seen:
+                    _seen.add(k)
+                    reward_extra_keys.append(k)
         for key in reward_extra_keys:
-            non_tensor_batch[key] = np.array([info[key] for info in reward_extra_infos])
+            values = [info.get(key, None) for info in reward_extra_infos]
+            try:
+                non_tensor_batch[key] = np.array(values)
+            except (ValueError, TypeError):
+                arr = np.empty(len(values), dtype=object)
+                arr[:] = values
+                non_tensor_batch[key] = arr
 
         # Add multi_modal_inputs to non_tensor_batch if any samples have them
         multi_modal_inputs_list = [input.multi_modal_inputs for input in inputs]

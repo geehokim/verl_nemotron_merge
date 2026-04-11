@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import math
 from typing import Any, Optional, Union
 
 _EVALUATION_LIB = None
@@ -119,9 +120,23 @@ def compute_score(
     evaluation_lib = _ensure_runtime()
     gt = _parse_ground_truth(ground_truth, extra_info)
 
-    # Filter out None values from kwargs (data may include all 23 fields with unused=None)
+    # Filter out unused fields and normalize numerics.
+    # Parquet stores IFEval kwargs as a union of ~23 fields with unused=None.
+    # pandas/pyarrow promotes numeric columns with nulls to float64+NaN, so:
+    #   1) NaN must be treated as "unused" (NaN is not None, so the old filter let it through,
+    #      causing silent miscalculation: NaN comparisons are always False).
+    #   2) Used integer fields arrive as e.g. 2.0, which crashes ParagraphFirstWordCheck
+    #      indexing (paragraphs[2.0 - 1]); cast .0 floats back to int.
+    def _is_unused(v):
+        return v is None or (isinstance(v, float) and math.isnan(v))
+
+    def _normalize_numeric(v):
+        if isinstance(v, float) and v.is_integer():
+            return int(v)
+        return v
+
     cleaned_kwargs = [
-        {k: v for k, v in kw.items() if v is not None}
+        {k: _normalize_numeric(v) for k, v in kw.items() if not _is_unused(v)}
         for kw in gt["kwargs"]
     ]
 

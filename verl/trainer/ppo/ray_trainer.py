@@ -604,19 +604,86 @@ class RayPPOTrainer:
 
         return gen_batch
 
+    def _derive_val_task_tag(self, sub_idx: int) -> str:
+        files = getattr(self.val_dataset, "data_files", None)
+        if files and sub_idx < len(files):
+            return os.path.splitext(os.path.basename(str(files[sub_idx])))[0]
+        return f"task{sub_idx}"
+
     def _validate(self):
+        # Per-task sequential validation. When val_dataset is MultiTaskRLHFDataset
+        # we iterate each sub-dataset independently so that generation, reward
+        # scoring, dumping, and metric aggregation never cross task boundaries.
+        # This avoids reward_extra_info key mismatches across tasks (e.g. math
+        # returns `answer_reward` while IFEval/coding do not) and keeps wandb
+        # keys cleanly namespaced by data_source.
+        sub_datasets = getattr(self.val_dataset, "sub_datasets", None)
+
+        metric_dict: dict = {}
+        agg_inputs: list = []
+        agg_outputs: list = []
+        agg_scores: list = []
+
+        if sub_datasets:
+            from torch.utils.data import DataLoader as _DataLoader
+
+            from verl.utils.dataset.rl_dataset import collate_fn as _default_collate_fn
+
+            val_batch_size = self.config.data.val_batch_size
+            if val_batch_size is None:
+                val_batch_size = max(len(sub) for sub in sub_datasets)
+            num_workers = self.config.data["dataloader_num_workers"]
+
+            for sub_idx, sub in enumerate(sub_datasets):
+                task_tag = self._derive_val_task_tag(sub_idx)
+                print(f"[validate] starting task {sub_idx + 1}/{len(sub_datasets)}: {task_tag} (n={len(sub)})")
+                task_loader = _DataLoader(
+                    dataset=sub,
+                    batch_size=val_batch_size,
+                    num_workers=num_workers,
+                    shuffle=False,
+                    drop_last=False,
+                    collate_fn=_default_collate_fn,
+                )
+                task_metric, t_in, t_out, t_sc, aborted = self._validate_one_task(task_loader, task_tag=task_tag)
+                if aborted:
+                    # Model-style RM disables rule-based validation entirely.
+                    return {}
+                metric_dict.update(task_metric)
+                agg_inputs.extend(t_in)
+                agg_outputs.extend(t_out)
+                agg_scores.extend(t_sc)
+        else:
+            task_metric, agg_inputs, agg_outputs, agg_scores, aborted = self._validate_one_task(
+                self.val_dataloader, task_tag=None
+            )
+            if aborted:
+                return {}
+            metric_dict.update(task_metric)
+
+        # One wandb table across all tasks — logger writes under a single key per
+        # step, so aggregating avoids clobbering per-task tables.
+        self._maybe_log_val_generations(inputs=agg_inputs, outputs=agg_outputs, scores=agg_scores)
+        return metric_dict
+
+    def _validate_one_task(self, dataloader, task_tag=None):
+        """Run generation + reward + metrics for a single task's dataloader.
+
+        Returns (metric_dict, sample_inputs, sample_outputs, sample_scores, aborted).
+        `aborted` is True when model-style reward model is configured, signalling
+        the caller to short-circuit the entire validation pass.
+        """
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
-        # Lists to collect samples for the table
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
-        sample_scores = []
-        sample_turns = []
-        sample_uids = []
+        sample_inputs: list = []
+        sample_outputs: list = []
+        sample_gts: list = []
+        sample_scores: list = []
+        sample_turns: list = []
+        sample_uids: list = []
 
-        for test_data in self.val_dataloader:
+        for test_data in dataloader:
             test_batch = DataProto.from_single_dict(test_data)
 
             if "uid" not in test_batch.non_tensor_batch:
@@ -624,18 +691,14 @@ class RayPPOTrainer:
                     [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
                 )
 
-            # repeat test batch
             test_batch = test_batch.repeat(
                 repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True
             )
 
-            # we only do validation on rule-based rm
             if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
-                return {}
+                return {}, [], [], [], True
 
-            # Store original inputs
             input_ids = test_batch.batch["input_ids"]
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
             sample_uids.extend(test_batch.non_tensor_batch["uid"])
@@ -656,7 +719,6 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # pad to be divisible by dp_size
             size_divisor = (
                 self.actor_rollout_wg.world_size
                 if not self.async_rollout_mode
@@ -668,12 +730,9 @@ class RayPPOTrainer:
             else:
                 test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
-            # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            print(f"validation generation end (task={task_tag})")
 
-            print("validation generation end")
-
-            # Store generated outputs
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
@@ -681,7 +740,6 @@ class RayPPOTrainer:
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
 
-            # evaluate using reward_function
             result = self._compute_or_extract_reward(test_batch, reward_fn=self.val_reward_fn, return_dict=True)
             reward_tensor = result["reward_tensor"]
             scores = reward_tensor.sum(-1).cpu().tolist()
@@ -690,63 +748,67 @@ class RayPPOTrainer:
             reward_extra_infos_dict["reward"].extend(scores)
             reward_extra_info = result.get("reward_extra_info", {})
             for key, values in reward_extra_info.items():
-                if key not in reward_extra_infos_dict:
-                    reward_extra_infos_dict[key] = []
                 if isinstance(values, np.ndarray):
                     reward_extra_infos_dict[key].extend(values.tolist())
                 else:
                     reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
 
-            # collect num_turns of each prompt
             if "__num_turns__" in test_batch.non_tensor_batch:
                 sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
 
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+            data_source_lst.append(
+                test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0])
+            )
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        # dump generations
+        # Per-task dump subdir keeps task JSONL files separated and stops one
+        # task from overwriting another's {global_steps}.jsonl.
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
         if val_data_dir:
+            task_dump_dir = os.path.join(val_data_dir, task_tag) if task_tag else val_data_dir
             self._dump_generations(
                 inputs=sample_inputs,
                 outputs=sample_outputs,
                 gts=sample_gts,
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
+                dump_path=task_dump_dir,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+            assert len(lst) == 0 or len(lst) == len(sample_scores), (
+                f"[task={task_tag}] {key_info}: {len(lst)=}, {len(sample_scores)=}"
+            )
 
-        data_sources = np.concatenate(data_source_lst, axis=0)
-
-        data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
-        metric_dict = {}
-        for data_source, var2metric2val in data_src2var2metric2val.items():
-            core_var = "acc" if "acc" in var2metric2val else "reward"
-            for var_name, metric2val in var2metric2val.items():
-                n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
-                for metric_name, metric_val in metric2val.items():
-                    if (
-                        (var_name == core_var)
-                        and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
-                        and (f"@{n_max}" in metric_name)
-                    ):
-                        metric_sec = "val-core"
-                    else:
-                        metric_sec = "val-aux"
-                    pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
-                    metric_dict[pfx] = metric_val
+        metric_dict: dict = {}
+        if data_source_lst:
+            data_sources = np.concatenate(data_source_lst, axis=0)
+            data_src2var2metric2val = process_validation_metrics(
+                data_sources, sample_uids, reward_extra_infos_dict
+            )
+            for data_source, var2metric2val in data_src2var2metric2val.items():
+                core_var = "acc" if "acc" in var2metric2val else "reward"
+                for var_name, metric2val in var2metric2val.items():
+                    n_max = max([int(name.split("@")[-1].split("/")[0]) for name in metric2val.keys()])
+                    for metric_name, metric_val in metric2val.items():
+                        if (
+                            (var_name == core_var)
+                            and any(metric_name.startswith(pfx) for pfx in ["mean", "maj", "best"])
+                            and (f"@{n_max}" in metric_name)
+                        ):
+                            metric_sec = "val-core"
+                        else:
+                            metric_sec = "val-aux"
+                        pfx = f"{metric_sec}/{data_source}/{var_name}/{metric_name}"
+                        metric_dict[pfx] = metric_val
 
         if len(sample_turns) > 0:
-            sample_turns = np.concatenate(sample_turns)
-            metric_dict["val-aux/num_turns/min"] = sample_turns.min()
-            metric_dict["val-aux/num_turns/max"] = sample_turns.max()
-            metric_dict["val-aux/num_turns/mean"] = sample_turns.mean()
+            sample_turns_arr = np.concatenate(sample_turns)
+            ns_key = f"val-aux/{task_tag}/num_turns" if task_tag else "val-aux/num_turns"
+            metric_dict[f"{ns_key}/min"] = sample_turns_arr.min()
+            metric_dict[f"{ns_key}/max"] = sample_turns_arr.max()
+            metric_dict[f"{ns_key}/mean"] = sample_turns_arr.mean()
 
-        return metric_dict
+        return metric_dict, sample_inputs, sample_outputs, sample_scores, False
 
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
@@ -1527,6 +1589,17 @@ class RayPPOTrainer:
                             skip_flags = batch.non_tensor_batch["skip"]
                             if not isinstance(skip_flags, np.ndarray):
                                 skip_flags = np.array(skip_flags)
+                            # In multi-task batches only the math reward sets
+                            # a "skip" field; IF/Coding samples have None
+                            # here, which makes the array object-dtype and
+                            # then torch.tensor(..., dtype=bool) fails. Coerce
+                            # None -> False so non-math samples are never
+                            # treated as skipped.
+                            if skip_flags.dtype == object:
+                                skip_flags = np.array(
+                                    [bool(x) if x is not None else False for x in skip_flags],
+                                    dtype=bool,
+                                )
                             skip_mask = torch.tensor(
                                 skip_flags, dtype=torch.bool, device=batch.batch["advantages"].device
                             )

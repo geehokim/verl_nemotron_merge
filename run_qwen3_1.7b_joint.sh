@@ -32,10 +32,6 @@ export PYTHONWARNINGS="ignore::UserWarning:megatron"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
 
-if [ -f /home/nsml/verl/bin/activate ]; then
-    source /home/nsml/verl/bin/activate
-fi
-
 # Ensure runtime dependencies for IFEval + coding rewards are installed.
 python - <<'PY'
 import importlib
@@ -68,7 +64,12 @@ for path, pkg in [("tokenizers/punkt", "punkt"), ("tokenizers/punkt_tab", "punkt
         nltk.download(pkg, quiet=True)
 PY
 
-export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+TRAINER_LOGGER="${TRAINER_LOGGER:-[\"console\"]}"
+if [[ "${TRAINER_LOGGER}" == *wandb* ]]; then
+    export WANDB_API_KEY="${WANDB_API_KEY:-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}"
+else
+    export WANDB_MODE=disabled
+fi
 export TRANSFORMERS_VERBOSITY=error
 export VLLM_LOGGING_LEVEL=DEBUG
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
@@ -112,20 +113,20 @@ VAL_MAX_SAMPLES=-1
 AGENT_NUM_WORKERS=8
 
 if [ "${SMOKE_MODE}" = "true" ]; then
-    MACHINE_GPU_COUNT=4
+    MACHINE_GPU_COUNT=2
     TRAIN_BATCH_SIZE=4
     VAL_BATCH_SIZE=4
     MAX_RESPONSE_LENGTH=2048
     PPO_MINI_BATCH_SIZE=4
     PPO_MICRO_BATCH_SIZE_PER_GPU=4
-    ROLLOUT_N=2
+    ROLLOUT_N=1
     ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
     ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=2048
-    ULYSSES_SEQUENCE_PARALLEL_SIZE=4
+    ULYSSES_SEQUENCE_PARALLEL_SIZE=2
     TEST_FREQ=5
     TRAIN_MAX_SAMPLES=64
-    VAL_MAX_SAMPLES=8
+    VAL_MAX_SAMPLES=1
     SAVE_FREQ=10
     AGENT_NUM_WORKERS=1
 fi
@@ -297,7 +298,7 @@ COMMON_ARGS=(
     +data.multitask_sampler.epoch_policy=largest
     data.dataloader_num_workers=0
 
-    actor_rollout_ref.actor.optim.lr=1e-6
+    actor_rollout_ref.actor.optim.lr=2e-6
     actor_rollout_ref.actor.optim.betas='[0.9,0.95]'
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
@@ -336,13 +337,13 @@ COMMON_ARGS=(
     custom_reward_function.path="${CUSTOM_REWARD_FN}"
     custom_reward_function.name=compute_score
 
-    trainer.logger='["console","wandb"]'
+    trainer.logger="${TRAINER_LOGGER}"
     trainer.project_name="${PROJECT_NAME}"
     trainer.experiment_name="${EXPERIMENT_NAME}"
     trainer.n_gpus_per_node="${MACHINE_GPU_COUNT}"
     trainer.nnodes="${WORLD_SIZE}"
     trainer.test_freq="${TEST_FREQ}"
-    trainer.val_before_train=True
+    trainer.val_before_train=False
     trainer.val_only="${VAL_ONLY}"
     trainer.resume_mode=auto
     trainer.save_freq="${SAVE_FREQ}"
