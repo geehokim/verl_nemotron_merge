@@ -940,9 +940,31 @@ class DataProto:
             batch_lst.append(batch.batch)
         new_batch = torch.cat(batch_lst, dim=0) if batch_lst[0] is not None else None
 
-        non_tensor_batch = list_of_dict_to_dict_of_list(list_of_dict=[d.non_tensor_batch for d in data])
-        for key, val in non_tensor_batch.items():
-            non_tensor_batch[key] = np.concatenate(val, axis=0)
+        # Union-merge non_tensor_batch across DataProto instances.  In
+        # multi-task training different workers may carry different keys
+        # (e.g. IFEval returns "strict_follow_all" while coding returns
+        # "timeout").  Take the union of all keys and pad missing entries
+        # with None so every key has the same total length after concat.
+        _all_ntb_keys: list[str] = []
+        _seen_ntb: set[str] = set()
+        for d in data:
+            for k in d.non_tensor_batch.keys():
+                if k not in _seen_ntb:
+                    _seen_ntb.add(k)
+                    _all_ntb_keys.append(k)
+
+        non_tensor_batch: dict[str, np.ndarray] = {}
+        for key in _all_ntb_keys:
+            arrays = []
+            for d in data:
+                if key in d.non_tensor_batch:
+                    arrays.append(d.non_tensor_batch[key])
+                else:
+                    n = len(d)
+                    pad = np.empty(n, dtype=object)
+                    pad[:] = None
+                    arrays.append(pad)
+            non_tensor_batch[key] = np.concatenate(arrays, axis=0)
 
         # Merge meta_info with special handling for metrics
         merged_meta_info = {}
@@ -957,6 +979,18 @@ class DataProto:
                                 all_metrics.extend(v)
                             else:
                                 all_metrics.append(v)
+                    elif k == "reward_extra_keys":
+                        # Union of reward extra keys across workers (multi-task
+                        # batches may split different task types across workers,
+                        # each returning a different key set).
+                        prev = merged_meta_info.get(k, [])
+                        seen = set(prev)
+                        merged = list(prev)
+                        for item in (v or []):
+                            if item not in seen:
+                                seen.add(item)
+                                merged.append(item)
+                        merged_meta_info[k] = merged
                     else:
                         if k in merged_meta_info:
                             # Ensure consistency for overlapping non-metric keys

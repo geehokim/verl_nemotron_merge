@@ -885,18 +885,20 @@ class AgentLoopManager:
         else:
             outputs = ray.get(refs)
         
-        output = DataProto.concat(outputs)
+        merged_output = DataProto.concat(outputs)
         # Fix for Issue #4147: Always call sleep() to ensure proper cleanup
         self.sleep()
         if self.reward_model_manager:
             self.reward_model_manager.sleep()
 
         # calculate performance metrics
-        metrics = [output.meta_info.pop("metrics") for output in outputs]  # List[List[Dict[str, str]]]
-        timing = self._performance_metrics(metrics, output)
+        metrics = [o.meta_info.pop("metrics") for o in outputs]  # List[List[Dict[str, str]]]
+        timing = self._performance_metrics(metrics, merged_output)
 
-        output.meta_info = {"timing": timing, **outputs[0].meta_info}
-        return output
+        # Preserve the union-merged meta_info from concat (e.g.
+        # reward_extra_keys across all workers), only adding timing on top.
+        merged_output.meta_info["timing"] = timing
+        return merged_output
 
     def _performance_metrics(self, metrics: list[list[dict[str, str]]], output: DataProto) -> dict[str, float]:
         timing = {}
