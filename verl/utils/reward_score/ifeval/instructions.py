@@ -405,7 +405,7 @@ class ConstrainedStartChecker(Instruction):
       True if the response starts with the given phrase or keyword that is
       contained in `instruction_args`; otherwise, False.
     """
-    response_pattern = r"^\s*" + self._starter + r".*$"
+    response_pattern = r"^\s*" + re.escape(self._starter) + r".*$"
     response_with_constrained_start = re.search(response_pattern, value,
                                                 flags=re.MULTILINE)
     return True if response_with_constrained_start else False
@@ -634,7 +634,7 @@ class PostscriptChecker(Instruction):
     elif self._postscript_marker == "P.S.":
       postscript_pattern = r"\s*p\.\s?s\..*$"
     else:
-      postscript_pattern = r"\s*" + self._postscript_marker.lower() + r".*$"
+      postscript_pattern = r"\s*" + re.escape(self._postscript_marker.lower()) + r".*$"
     postscript = re.findall(postscript_pattern, value, flags=re.MULTILINE)
     return True if postscript else False
 
@@ -740,7 +740,7 @@ class KeywordChecker(Instruction):
   def check_following(self, value):
     """Check if the response contain the expected keywords."""
     for keyword in self._keywords:
-      if not re.search(keyword, value, flags=re.IGNORECASE):
+      if not re.search(re.escape(keyword), value, flags=re.IGNORECASE):
         return False
     return True
 
@@ -805,7 +805,7 @@ class KeywordFrequencyChecker(Instruction):
   def check_following(self, value):
     """Checks if the response contain the keyword with required frequency."""
     actual_occurrences = len(re.findall(
-        self._keyword, value, flags=re.IGNORECASE))
+        re.escape(self._keyword), value, flags=re.IGNORECASE))
 
     if self._comparison_relation == _COMPARISON_RELATION[0]:
       return actual_occurrences < self._frequency
@@ -1110,7 +1110,7 @@ class ForbiddenWords(Instruction):
   def check_following(self, value):
     """Check if the response does not contain the expected keywords."""
     for word in self._forbidden_words:
-      if re.search(r"\b" + word + r"\b", value, flags=re.IGNORECASE):
+      if re.search(r"\b" + re.escape(word) + r"\b", value, flags=re.IGNORECASE):
         return False
     return True
 
