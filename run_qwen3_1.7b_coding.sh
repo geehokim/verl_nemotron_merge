@@ -59,7 +59,7 @@ VAL_ONLY=false
 SMOKE_MODE="${SMOKE_MODE:-false}"
 
 TRAIN_BATCH_SIZE=128
-VAL_BATCH_SIZE=64
+VAL_BATCH_SIZE=128
 # Kept at 32k here for Qwen3-1.7B
 # on this hardware; revisit if scaling up the model or GPU count.
 MAX_RESPONSE_LENGTH=32768
@@ -74,7 +74,7 @@ TEST_FREQ=10
 TRAIN_MAX_SAMPLES=-1
 VAL_MAX_SAMPLES=32
 # agent_loop chunks the gen batch across num_workers; must divide evenly.
-AGENT_NUM_WORKERS=8
+AGENT_NUM_WORKERS=4
 
 if [ "${SMOKE_MODE}" = "true" ]; then
     MACHINE_GPU_COUNT=4
@@ -89,10 +89,10 @@ if [ "${SMOKE_MODE}" = "true" ]; then
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192
     ULYSSES_SEQUENCE_PARALLEL_SIZE=4
     TEST_FREQ=5
-    TRAIN_MAX_SAMPLES=64
+    TRAIN_MAX_SAMPLES=10000
     VAL_MAX_SAMPLES=32
     SAVE_FREQ=10
-    AGENT_NUM_WORKERS=1
+    AGENT_NUM_WORKERS=2
 fi
 
 EXPERIMENT_NAME="qwen3-1.7b-ifrl-coding-livebench"
@@ -187,13 +187,13 @@ COMMON_ARGS=(
     data.train_max_samples="${TRAIN_MAX_SAMPLES}"
     data.val_max_samples="${VAL_MAX_SAMPLES}"
 
-    actor_rollout_ref.actor.optim.lr=2e-6
+    actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.optim.betas='[0.9,0.95]'
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}"
     actor_rollout_ref.actor.use_kl_loss=True
-    actor_rollout_ref.actor.kl_loss_coef=0.002
+    actor_rollout_ref.actor.kl_loss_coef=0.01
     actor_rollout_ref.actor.entropy_coeff=0.0
     actor_rollout_ref.model.enable_gradient_checkpointing=True
 
