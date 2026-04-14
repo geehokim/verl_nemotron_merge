@@ -162,7 +162,6 @@ if [ "${SMOKE_MODE}" = "true" ]; then
     AGENT_NUM_WORKERS=1
 fi
 
-
 EXPERIMENT_NAME="qwen3-1.7b-joint-if-coding-math"
 if [ "${SMOKE_MODE}" = "true" ]; then
     EXPERIMENT_NAME="${EXPERIMENT_NAME}-smoke"
