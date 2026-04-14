@@ -20,6 +20,25 @@ from tqdm import tqdm
 from tools.code_verifier_utils import run_test
 
 
+def _run_test_in_subprocess(problem_to_check, debug, timeout, child_conn):
+    """Run verifier in an isolated child process and return the result through a pipe.
+
+    Using Pipe keeps the existing process isolation/timeout behavior without
+    spawning an extra multiprocessing.Manager server process for every sample.
+    """
+    try:
+        res, metadata = run_test(problem_to_check, debug=debug, timeout=timeout)
+        child_conn.send((res, metadata))
+    except Exception as e:
+        fallback = [-1 for _ in range(len(problem_to_check["input_output"]))]
+        try:
+            child_conn.send((fallback, repr(e)))
+        except Exception:
+            pass
+    finally:
+        child_conn.close()
+
+
 def check_coding_correctness(problem_to_check: Optional[dict], timeout, debug=False):
     """Check correctness of code generation with a global timeout.
     
@@ -38,27 +57,29 @@ def check_coding_correctness(problem_to_check: Optional[dict], timeout, debug=Fa
     The global timeout is to catch some extreme/rare cases not handled by the timeouts
     inside `run_test`"""
 
-    def _temp_run(problem_to_check, debug, result, metadata_list, timeout):
-        try:
-            res, metadata = run_test(problem_to_check, debug=debug, timeout=timeout)
-            result.append(res)
-            metadata_list.append(metadata)
-        except Exception as e:
-            result.append([-1 for i in range(len(problem_to_check['input_output']))])
-            metadata_list.append(e)
-
-    manager = multiprocessing.Manager()
-    result = manager.list()
-    metadata_list = manager.list()
-
     total_timeout = (timeout + 1) * len(problem_to_check['input_output']) + 10
-    p = multiprocessing.Process(target=_temp_run, args=(problem_to_check, debug, result, metadata_list, timeout))
+    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
+    p = multiprocessing.Process(
+        target=_run_test_in_subprocess,
+        args=(problem_to_check, debug, timeout, child_conn),
+    )
     p.start()
+    child_conn.close()
     p.join(timeout=total_timeout + 1)
     if p.is_alive():
         p.kill()
+        p.join()
 
-    judge_value = bool(result and np.all(np.array(result[0]) > 0))
+    result = None
+    try:
+        if parent_conn.poll():
+            result, _metadata = parent_conn.recv()
+    except EOFError:
+        result = None
+    finally:
+        parent_conn.close()
+
+    judge_value = bool(result and np.all(np.array(result) > 0))
     return judge_value
 
 

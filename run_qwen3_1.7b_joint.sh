@@ -31,6 +31,36 @@ export PYTHONWARNINGS="ignore::UserWarning:megatron"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
+DEBUG_RAM_LOG="${DEBUG_RAM_LOG:-false}"
+DETECTED_GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ' || true)"
+
+
+log_debug_ram() {
+    if [ "${DEBUG_RAM_LOG}" != "true" ]; then
+        return 0
+    fi
+
+    local stage="${1:-unknown}"
+    echo "================ RAM DEBUG: ${stage} @ $(date '+%F %T %Z') ================"
+    free -h || true
+    echo "--- top processes by RSS ---"
+    ps -eo pid,ppid,rss,%mem,comm,args --sort=-rss | head -n 15 || true
+    echo "--- nvidia-smi ---"
+    nvidia-smi --query-gpu=index,name,memory.total,memory.used,utilization.gpu --format=csv,noheader || true
+    echo "==========================================================================="
+}
+
+on_error() {
+    local exit_code=$?
+    log_debug_ram "error"
+    echo "run_qwen3_1.7b_joint.sh failed with exit code ${exit_code}" >&2
+    exit "${exit_code}"
+}
+
+trap on_error ERR
+
+log_debug_ram "script_start"
+
 
 # Ensure runtime dependencies for IFEval + coding rewards are installed.
 python - <<'PY'
@@ -99,7 +129,7 @@ TRAIN_BATCH_SIZE=128
 VAL_BATCH_SIZE=128
 MAX_PROMPT_LENGTH=2048
 MAX_RESPONSE_LENGTH=32768
-PPO_MINI_BATCH_SIZE=128
+PPO_MINI_BATCH_SIZE=64
 PPO_MICRO_BATCH_SIZE_PER_GPU=64
 ROLLOUT_N=8
 ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=16
@@ -110,17 +140,18 @@ TEST_FREQ=25
 TRAIN_MAX_SAMPLES=-1
 VAL_MAX_SAMPLES=32
 # agent_loop chunks the gen batch across num_workers; must divide evenly.
-AGENT_NUM_WORKERS=8
+AGENT_NUM_WORKERS=1
 
 if [ "${SMOKE_MODE}" = "true" ]; then
-    MACHINE_GPU_COUNT=2
-    TRAIN_BATCH_SIZE=4
+    
+    MACHINE_GPU_COUNT=4
+    TRAIN_BATCH_SIZE=8
     VAL_BATCH_SIZE=4
     MAX_RESPONSE_LENGTH=2048
     PPO_MINI_BATCH_SIZE=4
-    PPO_MICRO_BATCH_SIZE_PER_GPU=4
+    PPO_MICRO_BATCH_SIZE_PER_GPU=2
     ROLLOUT_N=1
-    ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
+    ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=2
     ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=2048
     ULYSSES_SEQUENCE_PARALLEL_SIZE=2
@@ -131,6 +162,7 @@ if [ "${SMOKE_MODE}" = "true" ]; then
     AGENT_NUM_WORKERS=1
 fi
 
+
 EXPERIMENT_NAME="qwen3-1.7b-joint-if-coding-math"
 if [ "${SMOKE_MODE}" = "true" ]; then
     EXPERIMENT_NAME="${EXPERIMENT_NAME}-smoke"
@@ -138,6 +170,9 @@ fi
 
 echo "SMOKE_MODE=${SMOKE_MODE}"
 echo "TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}, MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH}, ROLLOUT_N=${ROLLOUT_N}"
+echo "MACHINE_GPU_COUNT=${MACHINE_GPU_COUNT}, ULYSSES_SEQUENCE_PARALLEL_SIZE=${ULYSSES_SEQUENCE_PARALLEL_SIZE}, PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}, PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
+
+log_debug_ram "after_hparams"
 
 # =============================================================================
 # Training data (mixed: IF + Coding + Math)
@@ -255,6 +290,7 @@ fi
 
 VAL_FILES_HYDRA="['${IFEVAL_VAL_PARQUET}','${AIME24_VAL_PARQUET}','${LIVEBENCH_VAL_PARQUET}']"
 echo "VAL_FILES_HYDRA=${VAL_FILES_HYDRA}"
+log_debug_ram "after_preflight_data"
 
 # =============================================================================
 # Common training arguments
@@ -382,6 +418,8 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path="${BASE_MODEL}" \
     +reward_model.reward_kwargs.overlong_filtering=False \
     trainer.total_epochs="${TOTAL_EPOCHS}"
+
+log_debug_ram "after_trainer"
 
 echo "=============================================="
 echo "Joint if+coding+math RL training complete."

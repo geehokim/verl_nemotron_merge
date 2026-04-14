@@ -335,7 +335,7 @@ def grade_call_based(
                             if np.allclose(float(prediction[i]), float(gt_out[i])) == False:
                                 all_matched = False
                                 break
-                        tmp_result = tmp.result or all_matched
+                        tmp_result = tmp_result or all_matched
                 except Exception:
                     pass
 

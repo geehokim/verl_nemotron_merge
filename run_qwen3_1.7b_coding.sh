@@ -11,6 +11,45 @@ export PYTHONWARNINGS="ignore::UserWarning:megatron"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="${SCRIPT_DIR}"
+DETECTED_GPU_COUNT="$(nvidia-smi --query-gpu=index --format=csv,noheader 2>/dev/null | wc -l | tr -d ' ' || true)"
+if [[ -z "${DETECTED_GPU_COUNT}" || "${DETECTED_GPU_COUNT}" == "0" ]]; then
+    DETECTED_GPU_COUNT=1
+fi
+
+validate_actor_batch_sizes() {
+    local total_gpus=$((WORLD_SIZE * MACHINE_GPU_COUNT))
+    local normalization_divisor
+    local normalized_ppo_mini_numerator
+    local normalized_ppo_mini_batch_size
+
+    if (( total_gpus <= 0 )); then
+        echo "Invalid total_gpus=${total_gpus}" >&2
+        exit 1
+    fi
+    if (( ULYSSES_SEQUENCE_PARALLEL_SIZE <= 0 )); then
+        echo "Invalid ULYSSES_SEQUENCE_PARALLEL_SIZE=${ULYSSES_SEQUENCE_PARALLEL_SIZE}" >&2
+        exit 1
+    fi
+    if (( total_gpus % ULYSSES_SEQUENCE_PARALLEL_SIZE != 0 )); then
+        echo "Invalid config: total_gpus=${total_gpus} must be divisible by ULYSSES_SEQUENCE_PARALLEL_SIZE=${ULYSSES_SEQUENCE_PARALLEL_SIZE}" >&2
+        exit 1
+    fi
+
+    normalization_divisor=$((total_gpus / ULYSSES_SEQUENCE_PARALLEL_SIZE))
+    normalized_ppo_mini_numerator=$((PPO_MINI_BATCH_SIZE * ROLLOUT_N))
+    if (( normalized_ppo_mini_numerator % normalization_divisor != 0 )); then
+        echo "Invalid config: PPO_MINI_BATCH_SIZE * ROLLOUT_N = ${normalized_ppo_mini_numerator} must be divisible by total_gpus / ulysses = ${normalization_divisor}" >&2
+        exit 1
+    fi
+
+    normalized_ppo_mini_batch_size=$((normalized_ppo_mini_numerator / normalization_divisor))
+    echo "normalized actor.ppo_mini_batch_size=${normalized_ppo_mini_batch_size} (raw=${PPO_MINI_BATCH_SIZE}, rollout_n=${ROLLOUT_N}, total_gpus=${total_gpus}, ulysses_sp=${ULYSSES_SEQUENCE_PARALLEL_SIZE})"
+
+    if (( normalized_ppo_mini_batch_size % PPO_MICRO_BATCH_SIZE_PER_GPU != 0 )); then
+        echo "Invalid config: normalized actor.ppo_mini_batch_size=${normalized_ppo_mini_batch_size} is not divisible by PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}" >&2
+        exit 1
+    fi
+}
 
 # Ensure runtime dependencies used by coding converter/reward are available.
 python - <<'PY'
@@ -63,7 +102,7 @@ VAL_BATCH_SIZE=128
 # Kept at 32k here for Qwen3-1.7B
 # on this hardware; revisit if scaling up the model or GPU count.
 MAX_RESPONSE_LENGTH=32768
-PPO_MINI_BATCH_SIZE=128
+PPO_MINI_BATCH_SIZE=64
 PPO_MICRO_BATCH_SIZE_PER_GPU=64
 ROLLOUT_N=8
 ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=16
@@ -74,20 +113,29 @@ TEST_FREQ=10
 TRAIN_MAX_SAMPLES=-1
 VAL_MAX_SAMPLES=32
 # agent_loop chunks the gen batch across num_workers; must divide evenly.
-AGENT_NUM_WORKERS=4
+AGENT_NUM_WORKERS=1
 
 if [ "${SMOKE_MODE}" = "true" ]; then
-    MACHINE_GPU_COUNT=4
+    MACHINE_GPU_COUNT="${DETECTED_GPU_COUNT}"
+    if (( MACHINE_GPU_COUNT > 4 )); then
+        MACHINE_GPU_COUNT=4
+    fi
     TRAIN_BATCH_SIZE=4
     VAL_BATCH_SIZE=4
     MAX_RESPONSE_LENGTH=2048
     PPO_MINI_BATCH_SIZE=4
-    PPO_MICRO_BATCH_SIZE_PER_GPU=4
+    PPO_MICRO_BATCH_SIZE_PER_GPU=1
     ROLLOUT_N=1
     ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
     ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192
-    ULYSSES_SEQUENCE_PARALLEL_SIZE=4
+    if (( MACHINE_GPU_COUNT >= 4 )); then
+        ULYSSES_SEQUENCE_PARALLEL_SIZE=4
+    elif (( MACHINE_GPU_COUNT >= 2 )); then
+        ULYSSES_SEQUENCE_PARALLEL_SIZE=2
+    else
+        ULYSSES_SEQUENCE_PARALLEL_SIZE=1
+    fi
     TEST_FREQ=5
     TRAIN_MAX_SAMPLES=10000
     VAL_MAX_SAMPLES=32
@@ -103,6 +151,8 @@ fi
 echo "SMOKE_MODE=${SMOKE_MODE}"
 echo "MACHINE_GPU_COUNT=${MACHINE_GPU_COUNT}, TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE}, VAL_BATCH_SIZE=${VAL_BATCH_SIZE}"
 echo "ROLLOUT_N=${ROLLOUT_N}, MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH}, ULYSSES_SP=${ULYSSES_SEQUENCE_PARALLEL_SIZE}"
+echo "PPO_MINI_BATCH_SIZE=${PPO_MINI_BATCH_SIZE}, PPO_MICRO_BATCH_SIZE_PER_GPU=${PPO_MICRO_BATCH_SIZE_PER_GPU}"
+validate_actor_batch_sizes
 echo "TRAIN_MAX_SAMPLES=${TRAIN_MAX_SAMPLES}, VAL_MAX_SAMPLES=${VAL_MAX_SAMPLES}"
 
 DATASET_ROOT="${DATASET_ROOT:-/131_data/geeho/data/Nemotron-RL-coding-competitive_coding}"
