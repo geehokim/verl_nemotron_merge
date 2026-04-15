@@ -212,7 +212,7 @@ COMMON_ARGS=(
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${PPO_MICRO_BATCH_SIZE_PER_GPU}"
     actor_rollout_ref.actor.use_kl_loss=True
-    actor_rollout_ref.actor.kl_loss_coef=0.01
+    actor_rollout_ref.actor.kl_loss_coef=0.004
     actor_rollout_ref.actor.entropy_coeff=0.0
     actor_rollout_ref.model.enable_gradient_checkpointing=True
 
@@ -220,7 +220,7 @@ COMMON_ARGS=(
     actor_rollout_ref.rollout.n="${ROLLOUT_N}"
     # Train rollout: unconstrained sampling (Nemotron-style), only temperature set.
     actor_rollout_ref.rollout.temperature=1.0
-    actor_rollout_ref.rollout.top_p=1.0
+    actor_rollout_ref.rollout.top_p=0.95
     actor_rollout_ref.rollout.top_k=-1
     actor_rollout_ref.rollout.agent.num_workers="${AGENT_NUM_WORKERS}"
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU}"
