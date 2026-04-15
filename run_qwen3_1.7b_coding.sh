@@ -40,6 +40,18 @@ export TRANSFORMERS_VERBOSITY=error
 export VLLM_LOGGING_LEVEL=DEBUG
 export PYTHONPATH="/home2/geeho/tmp/verl_nemotron_merge${PYTHONPATH:+:${PYTHONPATH}}"
 
+# Keep NCCL logs quiet by default to avoid INFO-level collective spam.
+# Enable detailed diagnostics only when needed:
+#   ENABLE_NCCL_DEBUG_LOGS=true bash run_qwen3_1.7b_coding.sh
+if [ "${ENABLE_NCCL_DEBUG_LOGS:-false}" = "true" ]; then
+    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+    export NCCL_DEBUG_SUBSYS="${NCCL_DEBUG_SUBSYS:-INIT,COLL}"
+    export TORCH_NCCL_TRACE_BUFFER_SIZE="${TORCH_NCCL_TRACE_BUFFER_SIZE:-20000}"
+else
+    export NCCL_DEBUG="${NCCL_DEBUG:-WARN}"
+fi
+export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+
 PROJECT_NAME="rl_merging"
 OUTPUT_DIR="/131_data/geeho/rl_merging_output/Qwen3-1.7B-coding"
 BASE_MODEL="Qwen/Qwen3-1.7B"
@@ -68,7 +80,12 @@ PPO_MINI_BATCH_SIZE=64
 PPO_MICRO_BATCH_SIZE_PER_GPU=64
 ROLLOUT_N=8
 ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=16
-ROLLOUT_GPU_MEMORY_UTILIZATION=0.90
+# Lowered from 0.90 to 0.70 to leave GPU headroom for the ref_policy NCCL
+# BROADCAST collective during init_model(). With 0.90 the colocated
+# ref_policy worker could not allocate the BROADCAST staging buffer and
+# the very first collective (SeqNum=1) timed out at 10 min, taking down
+# the whole cluster.
+ROLLOUT_GPU_MEMORY_UTILIZATION=0.70
 ROLLOUT_MAX_NUM_BATCHED_TOKENS=34816
 ULYSSES_SEQUENCE_PARALLEL_SIZE=4
 TEST_FREQ=10
@@ -85,16 +102,10 @@ if [ "${SMOKE_MODE}" = "true" ]; then
     PPO_MINI_BATCH_SIZE=4
     PPO_MICRO_BATCH_SIZE_PER_GPU=1
     ROLLOUT_N=1
-    ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=4
+    ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=1
     ROLLOUT_GPU_MEMORY_UTILIZATION=0.75
     ROLLOUT_MAX_NUM_BATCHED_TOKENS=8192
-    if (( MACHINE_GPU_COUNT >= 4 )); then
-        ULYSSES_SEQUENCE_PARALLEL_SIZE=4
-    elif (( MACHINE_GPU_COUNT >= 2 )); then
-        ULYSSES_SEQUENCE_PARALLEL_SIZE=2
-    else
-        ULYSSES_SEQUENCE_PARALLEL_SIZE=1
-    fi
+    ULYSSES_SEQUENCE_PARALLEL_SIZE=4
     TEST_FREQ=5
     TRAIN_MAX_SAMPLES=10000
     VAL_MAX_SAMPLES=32

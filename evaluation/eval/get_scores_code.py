@@ -6,18 +6,95 @@ It includes code execution, test case verification, and correctness checking.
 
 import argparse
 import copy
+import ctypes
 import glob
 import json
 import multiprocessing
 import os
+import platform
 import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Optional
+from typing import Any, Optional, Tuple
 
 import numpy as np
 from tqdm import tqdm
 
-from tools.code_verifier_utils import run_test
+from coding_ground_truth import normalize_ground_truth
+
+# Use the AceReason Evaluation Toolkit verifier as the single source of truth
+# for code correctness judgement. The local fork in
+# ``evaluation/eval/tools/code_verifier_utils.py`` had drifted from the
+# upstream reference in ways that materially changed reward semantics
+# (notably: no ``</think>`` completeness check, single-string ``has_code``
+# instead of a list, and a less robust ``replace_newlines``). To stay
+# faithful to the Nemotron paper's described reward function we route
+# directly to ``eval_release/tools/code_verifier.py`` and keep our only
+# delta there to the explicit ``reliability_guard`` memory cap.
+import os as _os
+import sys as _sys
+from pathlib import Path as _Path
+
+_ACEREASON_TOOLS = _Path(__file__).resolve().parents[2] / "eval_release" / "tools"
+if str(_ACEREASON_TOOLS) not in _sys.path:
+    _sys.path.insert(0, str(_ACEREASON_TOOLS))
+
+from code_verifier import run_test  # noqa: E402  (path-dependent import)
+
+
+# glibc malloc_trim: forces free heap chunks back to the OS. Useful as a
+# safety net when the parent process accumulates fragmented arenas, but
+# each call walks the heap free list (~10-100 ms on a heap of a few GB),
+# which adds up across hundreds of reward calls per training step. The
+# AceReason verifier does the heavy decode in the child, so the parent
+# barely allocates anything per call — the original "monotonic RSS leak"
+# concern that motivated this hook turned out to be a non-issue
+# (validated by a flat ~175 GB plateau over 100 steps without the hook).
+# Leave the helper available for opt-in via env (set
+# ``VERL_CODING_MALLOC_TRIM=1``) but skip it by default for throughput.
+_LIBC: Optional[ctypes.CDLL] = None
+try:
+    if platform.system() == "Linux":
+        _LIBC = ctypes.CDLL("libc.so.6")
+        _LIBC.malloc_trim.argtypes = [ctypes.c_size_t]
+        _LIBC.malloc_trim.restype = ctypes.c_int
+except OSError:
+    _LIBC = None
+
+_MALLOC_TRIM_ENABLED = os.getenv("VERL_CODING_MALLOC_TRIM", "0") == "1"
+
+
+def _release_parent_memory() -> None:
+    if not _MALLOC_TRIM_ENABLED or _LIBC is None:
+        return
+    try:
+        _LIBC.malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _get_verifier_mp_context():
+    """Return multiprocessing context for verifier subprocesses.
+
+    Default is ``fork``: cheapest spawn (~ms instead of ~50-100 ms for
+    forkserver), and the original COW-bloat concern is now mitigated by
+    (a) AceReason's ``</think>`` completeness check rejecting infinite
+    generations before they execute, and (b) the explicit ``RLIMIT_AS``
+    cap inside the child. Override with ``VERL_CODING_MP_START_METHOD``
+    if a future deployment ever needs the cleaner forkserver/spawn
+    isolation back.
+    """
+    preferred = os.getenv("VERL_CODING_MP_START_METHOD", "fork").strip().lower()
+    supported = multiprocessing.get_all_start_methods()
+    if preferred not in supported:
+        if "fork" in supported:
+            preferred = "fork"
+        elif "forkserver" in supported:
+            preferred = "forkserver"
+        elif supported:
+            preferred = supported[0]
+        else:
+            preferred = "fork"
+    return multiprocessing.get_context(preferred)
 
 
 def _run_test_in_subprocess(problem_to_check, debug, timeout, child_conn):
@@ -33,6 +110,42 @@ def _run_test_in_subprocess(problem_to_check, debug, timeout, child_conn):
         fallback = [-1 for _ in range(len(problem_to_check["input_output"]))]
         try:
             child_conn.send((fallback, repr(e)))
+        except Exception:
+            pass
+    finally:
+        child_conn.close()
+
+
+def _decode_and_run_test_in_subprocess(
+    raw_ground_truth: Any,
+    solution_str: str,
+    debug: bool,
+    timeout: int,
+    child_conn,
+) -> None:
+    """Child entrypoint that decodes the ground-truth payload inline.
+
+    The base64+zlib+pickle decode of the (potentially MB-sized) ground truth
+    happens HERE, inside the short-lived child process. The expanded Python
+    dict/list/string objects therefore never live in the parent's address
+    space, and the OS reclaims them in full when the child exits — no
+    pymalloc/glibc fragmentation accumulates in the long-lived parent.
+    """
+    num_tests = 0
+    try:
+        gt = normalize_ground_truth(raw_ground_truth)
+        num_tests = int(gt.get("num_tests") or len(gt.get("input_output", [])) or 0)
+        problem_to_check = {
+            "input_output": gt["input_output"],
+            "starter_code": gt["fn_name"] if gt["fn_name"] else "",
+            "generation": solution_str,
+        }
+        res, metadata = run_test(problem_to_check, debug=debug, timeout=timeout)
+        child_conn.send((res, metadata, num_tests))
+    except Exception as e:
+        fallback = [-1] * max(num_tests, 1)
+        try:
+            child_conn.send((fallback, repr(e), num_tests))
         except Exception:
             pass
     finally:
@@ -58,8 +171,9 @@ def check_coding_correctness(problem_to_check: Optional[dict], timeout, debug=Fa
     inside `run_test`"""
 
     total_timeout = (timeout + 1) * len(problem_to_check['input_output']) + 10
-    parent_conn, child_conn = multiprocessing.Pipe(duplex=False)
-    p = multiprocessing.Process(
+    ctx = _get_verifier_mp_context()
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(
         target=_run_test_in_subprocess,
         args=(problem_to_check, debug, timeout, child_conn),
     )
@@ -80,7 +194,67 @@ def check_coding_correctness(problem_to_check: Optional[dict], timeout, debug=Fa
         parent_conn.close()
 
     judge_value = bool(result and np.all(np.array(result) > 0))
+    _release_parent_memory()
     return judge_value
+
+
+def check_coding_correctness_from_raw(
+    raw_ground_truth: Any,
+    solution_str: str,
+    timeout: int = 6,
+    debug: bool = False,
+    estimated_num_tests: int = 50,
+) -> Tuple[bool, int]:
+    """Verify generated code without materializing the decoded ground truth in the parent.
+
+    The raw (still encoded) ground-truth payload is passed straight through to
+    a freshly-spawned child process, where ``normalize_ground_truth`` does the
+    heavy decode. The parent therefore never grows its pymalloc/glibc heap
+    with the big intermediate dicts/strings — the dominant source of the
+    monotonically-increasing parent RSS observed across long training runs.
+
+    Args:
+        raw_ground_truth: Raw (encoded or pre-parsed) ground-truth payload.
+        solution_str: Generated solution to verify.
+        timeout: Per-testcase timeout in seconds (passed through to ``run_test``).
+        debug: Whether to enable verifier debug printing.
+        estimated_num_tests: Conservative upper bound used to derive the
+            global wall-clock cap for the child. Real ``num_tests`` is reported
+            back from the child for the caller's bookkeeping.
+
+    Returns:
+        Tuple of ``(passed, num_tests)`` where ``num_tests`` is the actual
+        number of test cases discovered after decoding (0 on decode failure).
+    """
+    total_timeout = (timeout + 1) * max(int(estimated_num_tests), 1) + 10
+    ctx = _get_verifier_mp_context()
+    parent_conn, child_conn = ctx.Pipe(duplex=False)
+    p = ctx.Process(
+        target=_decode_and_run_test_in_subprocess,
+        args=(raw_ground_truth, solution_str, debug, timeout, child_conn),
+    )
+    p.start()
+    child_conn.close()
+    p.join(timeout=total_timeout + 1)
+    if p.is_alive():
+        p.kill()
+        p.join()
+
+    result = None
+    num_tests = 0
+    try:
+        if parent_conn.poll():
+            recv = parent_conn.recv()
+            result = recv[0]
+            num_tests = int(recv[2]) if len(recv) >= 3 else 0
+    except EOFError:
+        result = None
+    finally:
+        parent_conn.close()
+
+    judge_value = bool(result and np.all(np.array(result) > 0))
+    _release_parent_memory()
+    return judge_value, num_tests
 
 
 def update_results(result, timeout=10):

@@ -8,16 +8,27 @@ which is used by evaluate_livecodebench).
 
 from __future__ import annotations
 
-import base64
 import importlib.util
-import json
-import pickle
 import re
 import sys
 import traceback
-import zlib
 from pathlib import Path
 from typing import Any
+
+# Decode helpers live in a standalone module so the verifier child process
+# (forkserver-spawned by get_scores_code.py) can re-import them by name.
+# We register the eval/ dir on sys.path early so both this parent module and
+# the spawned children can resolve `import coding_ground_truth`.
+_EVAL_DIR = Path(__file__).resolve().parent
+if str(_EVAL_DIR) not in sys.path:
+    sys.path.insert(0, str(_EVAL_DIR))
+
+from coding_ground_truth import (  # noqa: E402
+    as_str as _as_str,
+    decode_payload_text as _decode_payload_text,
+    normalize_ground_truth as _normalize_ground_truth,
+    safe_json_loads as _safe_json_loads,
+)
 
 try:
     from ftlangdetect import detect as ft_detect
@@ -108,6 +119,15 @@ def _default_compute_score_lazy(
 
 
 def _load_code_eval_module():
+    """Import ``get_scores_code`` so that its name is a regular sys.modules entry.
+
+    Crucially, the forkserver child process needs to be able to unpickle the
+    target function reference for ``_decode_and_run_test_in_subprocess``; that
+    requires the function to live in a module reachable by name. Loading via
+    ``importlib.util.spec_from_file_location("_verl_get_scores_code", ...)``
+    used to register a hash-style name that the child couldn't resolve, so we
+    now prepend ``evaluation/eval`` to ``sys.path`` and use a normal import.
+    """
     global _EVAL_MODULE
     if _EVAL_MODULE is not None:
         return _EVAL_MODULE
@@ -120,12 +140,9 @@ def _load_code_eval_module():
     if str(eval_dir) not in sys.path:
         sys.path.insert(0, str(eval_dir))
 
-    spec = importlib.util.spec_from_file_location("_verl_get_scores_code", str(module_path))
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f"Failed to load module spec: {module_path}")
+    import importlib
 
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = importlib.import_module("get_scores_code")
     _EVAL_MODULE = module
     return module
 
@@ -163,87 +180,6 @@ def _ensure_ifeval_runtime():
     module._ensure_nltk_resources(nltk_module)
     _IFEVAL_EVALUATION_LIB = module._ensure_vendor_imports()
     return _IFEVAL_EVALUATION_LIB
-
-
-def _safe_json_loads(text: str) -> Any:
-    try:
-        return json.loads(text)
-    except Exception:
-        return None
-
-
-def _as_str(value: Any) -> str:
-    if isinstance(value, str):
-        return value
-    if value is None:
-        return ""
-    try:
-        return json.dumps(value, ensure_ascii=False)
-    except Exception:
-        return str(value)
-
-
-def _decode_payload_text(payload_text: str) -> Any:
-    """Decode base64+zlib+pickle(json.dumps(...)) payload."""
-    raw = base64.b64decode(payload_text.encode("utf-8"))
-    decomp = zlib.decompress(raw)
-    obj = pickle.loads(decomp)
-    if isinstance(obj, (bytes, bytearray)):
-        obj = obj.decode("utf-8")
-    if isinstance(obj, str):
-        parsed = _safe_json_loads(obj)
-        return obj if parsed is None else parsed
-    return obj
-
-
-def _normalize_ground_truth(ground_truth: Any) -> dict[str, Any]:
-    payload = ground_truth
-
-    if isinstance(payload, str):
-        parsed = _safe_json_loads(payload)
-        if parsed is not None:
-            payload = parsed
-        else:
-            try:
-                payload = _decode_payload_text(payload)
-            except Exception as exc:
-                raise ValueError(f"Failed to decode coding ground_truth payload: {exc}") from exc
-
-    if not isinstance(payload, dict):
-        raise ValueError(f"Unsupported coding ground_truth type: {type(payload)}")
-
-    if "inputs" in payload and "outputs" in payload:
-        inputs = payload.get("inputs", [])
-        outputs = payload.get("outputs", [])
-        fn_name = _as_str(payload.get("fn_name", "")).strip()
-    elif "input_output" in payload:
-        io_pairs = payload.get("input_output", [])
-        if isinstance(io_pairs, str):
-            parsed = _safe_json_loads(io_pairs)
-            io_pairs = parsed if parsed is not None else []
-        if not isinstance(io_pairs, list):
-            io_pairs = []
-        inputs = [_as_str(x.get("input", "")) for x in io_pairs if isinstance(x, dict)]
-        outputs = [_as_str(x.get("output", "")) for x in io_pairs if isinstance(x, dict)]
-        fn_name = _as_str(payload.get("fn_name", "")).strip()
-    else:
-        raise ValueError("coding ground_truth must include inputs/outputs or input_output")
-
-    if not isinstance(inputs, list) or not isinstance(outputs, list):
-        raise ValueError("coding ground_truth inputs/outputs must be lists")
-
-    input_output = [
-        {"input": _as_str(inp), "output": _as_str(out)}
-        for inp, out in zip(inputs, outputs, strict=False)
-    ]
-    if not input_output:
-        raise ValueError("Empty coding testcases in ground_truth")
-
-    return {
-        "input_output": input_output,
-        "fn_name": fn_name,
-        "num_tests": len(input_output),
-    }
 
 
 def _get_prompt_language(extra_info: dict[str, Any] | None) -> str:
@@ -286,7 +222,7 @@ def _detect_code_switching(solution_str: str, prompt_language: str) -> bool:
         return False
 
 
-def _resolve_timeout(extra_info: dict[str, Any] | None, num_tests: int) -> int:
+def _resolve_timeout(extra_info: dict[str, Any] | None, num_tests: int | None = None) -> int:
     default_timeout = 6
     if isinstance(extra_info, dict):
         for key in ("test_time_limit", "timeout", "time_limit"):
@@ -299,7 +235,10 @@ def _resolve_timeout(extra_info: dict[str, Any] | None, num_tests: int) -> int:
 
     # Keep runtime bounded for reward loop stability.
     per_test = max(2, min(20, int(default_timeout)))
-    if num_tests > 20:
+    # The >20-tests reduction only applies when caller already knows the
+    # count. With the raw-payload path the parent doesn't decode, so the
+    # reduction simply doesn't trigger here — that's fine, it's a soft hint.
+    if num_tests is not None and num_tests > 20:
         per_test = min(per_test, 8)
     return per_test
 
@@ -314,6 +253,32 @@ def _evaluate_coding_correctness(problem_to_check: dict[str, Any], timeout: int)
         raise AttributeError("check_coding_correctness not found in get_scores_code.py")
 
     return bool(checker(problem_to_check, timeout=timeout))
+
+
+def _evaluate_coding_correctness_from_raw(
+    raw_ground_truth: Any, solution_str: str, timeout: int
+) -> tuple[bool, int]:
+    """Run verifier without materializing the decoded ground truth in the parent.
+
+    Routes through ``check_coding_correctness_from_raw``, which does the
+    base64+zlib+pickle decode inside the short-lived child process. The OS
+    reclaims the entire child address space on exit, so the parent's
+    pymalloc/glibc heap stays flat across reward calls — eliminating the
+    monotonic RSS growth that previously dominated long training runs.
+
+    Returns ``(passed, num_tests)``; ``num_tests`` comes back from the child
+    so the caller can record it without re-decoding.
+    """
+    module = _load_code_eval_module()
+    checker = getattr(module, "check_coding_correctness_from_raw", None)
+    if checker is None:
+        raise AttributeError("check_coding_correctness_from_raw not found in get_scores_code.py")
+    passed, num_tests = checker(
+        raw_ground_truth=raw_ground_truth,
+        solution_str=solution_str,
+        timeout=timeout,
+    )
+    return bool(passed), int(num_tests)
 
 
 def _normalize_ifeval_ground_truth(
@@ -394,16 +359,19 @@ def _compute_coding_score(
     ground_truth: Any,
     extra_info: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    gt = _normalize_ground_truth(ground_truth)
-
-    timeout = _resolve_timeout(extra_info, gt["num_tests"])
-    problem = {
-        "input_output": gt["input_output"],
-        "starter_code": gt["fn_name"] if gt["fn_name"] else "",
-        "generation": solution_str,
-    }
-
-    is_correct = _evaluate_coding_correctness(problem, timeout=timeout)
+    # Important: we do NOT decode `ground_truth` in this (parent) process.
+    # The base64+zlib+pickle expansion of competitive-coding payloads can
+    # produce hundreds of MB of small Python objects per sample; doing it
+    # here causes pymalloc/glibc to retain those pages, so parent RSS climbs
+    # monotonically across thousands of reward calls. Instead we hand the
+    # raw payload to a forkserver-spawned child, which does the decode and
+    # then exits — letting the OS reclaim everything cleanly.
+    timeout = _resolve_timeout(extra_info)
+    is_correct, num_tests = _evaluate_coding_correctness_from_raw(
+        raw_ground_truth=ground_truth,
+        solution_str=solution_str,
+        timeout=timeout,
+    )
     answer_reward = 1.0 if is_correct else 0.0
 
     apply_code_switch_override = data_source in CODING_TRAIN_SOURCES
@@ -424,7 +392,7 @@ def _compute_coding_score(
         "code_switching": bool(has_code_switching),
         "code_switching_penalty": float(code_switching_penalty),
         "timeout": int(timeout),
-        "num_tests": int(gt["num_tests"]),
+        "num_tests": int(num_tests),
         # Match the key set returned by the math reward so joint multi-task
         # batches don't produce object-dtype arrays with None entries in
         # downstream trainer hooks (e.g. the overlong-filter skip_mask).

@@ -11,7 +11,6 @@ import os
 import signal
 import time
 import numpy as np
-
 from io import StringIO
 
 # used for testing the code that reads from input
@@ -25,7 +24,7 @@ from decimal import Decimal
 import time
 from typing import List
 
-import_string = "import sys\nsys.setrecursionlimit(1 << 25)\nsys.set_int_max_str_digits(1 << 25)\nimport time\nimport re\nimport bisect\nimport itertools\nfrom itertools import accumulate, product, permutations, combinations\nimport collections\nfrom collections import Counter, OrderedDict, deque, defaultdict, ChainMap\nfrom functools import lru_cache\nimport math\nfrom math import sqrt, sin, cos, tan, ceil, fabs, floor, gcd, exp, log, log2\nimport fractions\nfrom typing import List, Tuple\nimport numpy as np\nimport random\nimport heapq\nfrom heapq import *\n"
+import_string = "import sys\nsys.setrecursionlimit(1 << 25)\nimport time\nimport re\nimport bisect\nimport itertools\nfrom itertools import accumulate, product, permutations, combinations\nimport collections\nfrom collections import Counter, OrderedDict, deque, defaultdict, ChainMap\nfrom functools import lru_cache\nimport math\nfrom math import sqrt, sin, cos, tan, ceil, fabs, floor, gcd, exp, log, log2, comb\nimport fractions\nfrom typing import *\nimport numpy as np\nimport random\nimport heapq\nfrom heapq import *\n"
 
 def convert_python_literal_to_json(s):
     obj = ast.literal_eval(s)
@@ -39,7 +38,7 @@ def convert_python_literal(arg_str):
         wrapped_str = f"({arg_str},)"
     else:
         wrapped_str = f"({arg_str})"
-
+    
     try:
         parsed_tuple = ast.literal_eval(wrapped_str)
     except Exception as e:
@@ -56,7 +55,7 @@ def post_process_code(code):
 def extract_functions(code_str):
     tree = ast.parse(code_str)
     extracted = []
-
+    
     # Iterate over top-level nodes in the module.
     for node in tree.body:
         # Check for import statements.
@@ -71,18 +70,13 @@ def extract_functions(code_str):
         elif isinstance(node, ast.ClassDef):
             code_segment = ast.get_source_segment(code_str, node)
             extracted.append(code_segment)
-
+    
     return extracted
 
-PATTERN = re.compile(
-    r"(?ms)^```python(?:\w+)?\n"          # opener at start of a line
-    r"(?P<code>(?:(?!^```python).)*?)"    # content that never starts a new ###python
-    r"^\s*```\s*$"                        # closer '###' on its own line
-)
-
 def has_code(response):
-    matches = list(PATTERN.finditer(response))
-    return matches[-1].group("code") if matches else None
+    pattern = r"```python(?:[a-zA-Z0-9]*)\n(.*?)```"
+    matches = re.findall(pattern, response, re.DOTALL)
+    return matches
 
 def truncatefn(s, length=300):
     if isinstance(s, str):
@@ -126,52 +120,82 @@ class Capturing(list):
         del self._stringio  # free up some memory
         sys.stdout = self._stdout
 
-
 def clean_if_name(code: str) -> str:
     try:
+        # Parse the code into an AST.
         astree = ast.parse(code)
+        if not astree.body:
+            return code
+
         last_block = astree.body[-1]
         if isinstance(last_block, ast.If):
-            condition = last_block.test
-            if ast.unparse(condition).strip() == "__name__ == '__main__'":
-                code = (
-                    ast.unparse(astree.body[:-1]) + "\n" + ast.unparse(last_block.body)  # type: ignore
-                )
-    except:
+            # Extract the source text for the if-statement's condition.
+            condition_segment = ast.get_source_segment(code, last_block.test)
+            if condition_segment and condition_segment.strip() == "__name__ == '__main__'":
+                # Extract code segments for all nodes before the if block.
+                pre_if_segments = []
+                for node in astree.body[:-1]:
+                    segment = ast.get_source_segment(code, node)
+                    if segment is not None:
+                        pre_if_segments.append(segment)
+                # Extract code segments for the nodes in the if block's body.
+                if_body_segments = []
+                for node in last_block.body:
+                    segment = ast.get_source_segment(code, node)
+                    if segment is not None:
+                        if_body_segments.append(segment)
+                # Combine the segments with a newline.
+                code = "\n".join(pre_if_segments + if_body_segments)
+    except Exception:
         pass
 
     return code
 
-
 def make_function(code: str) -> str:
     try:
         import_stmts = []
-        all_other_stmts = []
-        astree = ast.parse(code)
-        for stmt in astree.body:
-            if isinstance(stmt, (ast.Import, ast.ImportFrom)):
-                import_stmts.append(stmt)
+        other_stmts = []
+        tree = ast.parse(code)
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                import_stmts.append(node)
             else:
-                all_other_stmts.append(stmt)
+                other_stmts.append(node)
 
-        function_ast = ast.FunctionDef(
-            name="wrapped_function",
-            args=ast.arguments(
-                posonlyargs=[], args=[], kwonlyargs=[], kw_defaults=[], defaults=[]
-            ),
-            body=all_other_stmts,
-            decorator_list=[],
-            lineno=-1,
-        )
+        # Extract the original source segments for the import statements.
+        imports_code = []
+        for node in import_stmts:
+            seg = ast.get_source_segment(code, node)
+            if seg:
+                imports_code.append(seg)
+        
+        # Extract the source segments for all other statements.
+        body_code = []
+        for node in other_stmts:
+            seg = ast.get_source_segment(code, node)
+            if seg:
+                body_code.append(seg)
+
+        # Create the body of the new function by indenting the extracted statements.
+        indented_body = []
+        for stmt in body_code:
+            indented_lines = [
+                "    " + line if line.strip() else line 
+                for line in stmt.splitlines()
+            ]
+            indented_body.append("\n".join(indented_lines))
+        
+        # Construct the function definition string.
+        function_code = "def wrapped_function():\n" + "\n".join(indented_body)
+        
+        # Combine the import string, the imports, and the function code.
         main_code = (
-            import_string
-            + "\n"
-            + ast.unparse(import_stmts)  # type: ignore
-            + "\n"
-            + ast.unparse(function_ast)  # type: ignore
+            import_string + "\n" +
+            "\n".join(imports_code) + "\n" +
+            function_code
         )
         return main_code
-    except Exception as e:
+    except Exception:
         return code
 
 
@@ -182,11 +206,15 @@ def call_method(method, inputs):
 
     inputs_line_iterator = iter(inputs.split("\n"))
 
+    # sys.setrecursionlimit(10000)
+
+    # @patch('builtins.input', side_effect=inputs.split("\n"))
     @patch("builtins.open", mock_open(read_data=inputs))
     @patch("sys.stdin", StringIO(inputs))
     @patch("sys.stdin.readline", lambda *args: next(inputs_line_iterator))
     @patch("sys.stdin.readlines", lambda *args: inputs.split("\n"))
     @patch("sys.stdin.read", lambda *args: inputs)
+    # @patch('sys.stdout.write', print)
     def _inner_call_method(_method):
         try:
             return _method()
@@ -227,8 +255,6 @@ def compile_code(code: str, timeout: int):
 
     return compiled_sol
 
-
-# def convert_line_to_decimals(line: str) -> tuple[bool, List[Float]]:
 def convert_line_to_decimals(line: str):
     try:
         decimal_line = [float(elem) for elem in line.split()]
@@ -243,11 +269,25 @@ def get_stripped_lines(val: str):
 
     return [val_line.strip() for val_line in val.split("\n")]
 
+def replace_newlines(text):
+    result = []
+    depth = 0  # tracks nesting level for [] and {}
+    for char in text:
+        if char in "[{":
+            depth += 1
+        elif char in "]}":
+            depth -= 1
+        # Replace newline with comma only if not nested.
+        if char == "\n" and depth == 0:
+            result.append(",")
+        else:
+            result.append(char)
+    return "".join(result)
 
 def grade_call_based(
     code: str, all_inputs: list, all_outputs: list, fn_name: str, timeout: int
 ):
-
+        
     # call-based clean up logic
     # need to wrap in try-catch logic after to catch the correct errors, but for now this is fine.
     base_code = import_string + "\n\n" + code + '\n\n'
@@ -258,7 +298,7 @@ def grade_call_based(
         base_code += 'def run_main_code():\n'
 
     all_inputs = [
-            inputs.replace("\n", ",") for inputs in all_inputs
+            replace_newlines(inputs) for inputs in all_inputs
     ]
 
     triggered = False
@@ -294,12 +334,12 @@ def grade_call_based(
 
         compiled_sol = compile_code(code, timeout)
         if compiled_sol is None:
-            return
+            return [-200], {"Compile Error while running the testcases."}  
 
         method = get_function(compiled_sol, "run_main_code")
-
+        
         if method is None:
-            return
+            return [-200], {"Compile Error while running the testcases."}
 
         signal.alarm(timeout)
         faulthandler.enable()
@@ -338,7 +378,7 @@ def grade_call_based(
                         tmp_result = tmp_result or all_matched
                 except Exception:
                     pass
-
+                    
 
             # handle floating point comparisons
 
@@ -364,7 +404,10 @@ def grade_call_based(
                     "expected": truncatefn(gt_out),
                 }
             else:
-                all_results.append(-4)
+                if "NameError" in repr(e):
+                    all_results.append(-200)
+                else:
+                    all_results.append(-300)
                 return all_results, {
                     "error": repr(e),
                     "error_code": -4,
@@ -391,16 +434,16 @@ def grade_stdio(
 
     ## we wrap the given code inside another function
     code = make_function(code)
-
+    
     compiled_sol = compile_code(code, timeout)
-
+        
     if compiled_sol is None:
-        return
+        return [-200], {"Compile Error while running the testcases."}  
 
     method = get_function(compiled_sol, "wrapped_function")
 
     if method is None:
-        return
+        return [-200], {"Compile Error while running the testcases."}  
 
     all_results = []
     total_execution_time = 0
@@ -428,7 +471,7 @@ def grade_stdio(
                         "expected": truncatefn(gt_out),
                     }
                 else:
-                    all_results.append(-4)
+                    all_results.append(-300)
                     return all_results, {
                         "error": repr(e),
                         "error_code": -4,
@@ -470,7 +513,7 @@ def grade_stdio(
             ## CASE 1: exact match
             if stripped_prediction_line == stripped_gt_out_line:
                 continue
-
+            
             ## CASE 2: element-wise comparision
             ## if there are floating elements
             ## use `decimal` library for good floating point comparision
@@ -486,14 +529,14 @@ def grade_stdio(
                 return all_results, WA_send_args
 
             success, decimal_gtout_line = convert_line_to_decimals(stripped_gt_out_line)
-
+            
             if not success:
                 all_results.append(-2)
                 return all_results, WA_send_args
-
+            
             if decimal_prediction_line == decimal_gtout_line:
                 continue
-
+            
             ok = False
             try:
                 if len(decimal_prediction_line) == len(decimal_gtout_line) and np.allclose(decimal_prediction_line, decimal_gtout_line):
@@ -501,7 +544,7 @@ def grade_stdio(
             except Exception:
                 pass
 
-            if ok:
+            if ok: 
                 continue
             all_results.append(-2)
             return all_results, WA_send_args
@@ -518,20 +561,13 @@ def run_test(problem_to_check, debug=False, timeout=6):
     signal.signal(signal.SIGALRM, timeout_handler)
     # Disable functionalities that can make destructive changes to the test.
     #
-    # Per-child memory cap. Default 8 GiB chosen by inspecting the actual
-    # training and validation payloads of this project:
-    #   - Nemotron RL coding train: decoded payload max ~47 MiB,
-    #     single output up to ~6.6 MiB, up to 322 test cases per problem.
-    #   - LiveBench validation: decoded payload max ~88 MiB,
-    #     single input up to ~10.3 MiB.
-    # A correct solution against a 10 MiB input typically needs ~5-50x that
-    # in working memory once parsed into Python objects, so a realistic
-    # worst case for legitimate code is on the order of 2-3 GiB. The 8 GiB
-    # cap leaves comfortable headroom while still containing adversarial
-    # generations like `"a" * 10**11` or unbounded recursion (the verifier
-    # already raises sys.setrecursionlimit to 1<<25 inside the child).
-    # Override per-environment via VERL_CODING_CHILD_MEM_LIMIT_BYTES; set
-    # to 0 to disable the cap entirely.
+    # Per-child memory cap (default 8 GiB). The original AceReason call site
+    # left this as ``reliability_guard()`` despite the comment claiming a
+    # 4 GiB cap, which meant adversarial generations could allocate
+    # unbounded memory before the wall-clock alarm fired. We pass an
+    # explicit cap so a single rogue generation hits MemoryError in-child
+    # and the parent reward router stays healthy. Override per-environment
+    # via VERL_CODING_CHILD_MEM_LIMIT_BYTES; set to ``0`` to disable.
     _mem_cap_bytes = 8 * 1024 ** 3
     try:
         _override = os.environ.get("VERL_CODING_CHILD_MEM_LIMIT_BYTES")
@@ -542,22 +578,33 @@ def run_test(problem_to_check, debug=False, timeout=6):
     reliability_guard(maximum_memory_bytes=_mem_cap_bytes if _mem_cap_bytes > 0 else None)
 
     generation = problem_to_check['generation']
-
+    
     generation = has_code(generation)
 
-    if generation is None:
-        return [-1], "No code found."
+    if len(generation) >= 1 and generation[0] == 'Your code\n':
+        generation = generation[1:]
+   
+    if "</think>" not in problem_to_check['generation']:
+        return [-100], "No code found or code is incomplete."
 
+    if len(generation) == 0:
+        return [-100], "No code found or code is incomplete."
+    
     if debug:
         print(f"start = {datetime.now().time()}")
 
     if problem_to_check['starter_code'] == '':
         which_type = CODE_TYPE.standard_input  # Standard input
         method_name = None
+        generation = generation[-1]
     else:
         starter = problem_to_check['starter_code']
         which_type = CODE_TYPE.call_based  # Call-based
         method_name = problem_to_check['starter_code']
+        try:
+            generation = "\n".join(extract_functions('\n'.join(generation)))
+        except:
+            return [-200], "Compile Error"
 
     generation = post_process_code(generation).replace("\t", "    ").replace('if __name__ == "__main__":', 'if True:').replace("if __name__ == '__main__':", 'if True:')
 
@@ -573,7 +620,7 @@ def run_test(problem_to_check, debug=False, timeout=6):
             outputs.append(in_out['output'])
 
     assert(len(inputs) == len(outputs))
-
+    
     if debug:
         print(f"loaded {len(inputs)} Input-Output pairs = {datetime.now().time()}")
 
@@ -593,7 +640,7 @@ def run_test(problem_to_check, debug=False, timeout=6):
             )
             return results, metadata
         except Exception as e:
-            return [-4], f"Call-based Error as {e}"
+            return [-4], f"Call-based Error as {e}" 
         finally:
             signal.alarm(0)
 
@@ -697,3 +744,4 @@ def reliability_guard(maximum_memory_bytes=None):
     sys.modules["resource"] = None
     sys.modules["psutil"] = None
     sys.modules["tkinter"] = None
+

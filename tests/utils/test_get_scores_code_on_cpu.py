@@ -11,11 +11,24 @@ if str(EVAL_DIR) not in sys.path:
 import get_scores_code  # noqa: E402
 
 
-def _stdio_problem(code_block: str) -> dict:
+def _stdio_problem(code_block: str, *, with_think_close: bool = True) -> dict:
+    """Build a verifier-ready problem dict.
+
+    AceReason's ``run_test`` requires the generation to contain ``</think>``
+    so an unfinished thinking trace cannot be silently treated as code.
+    Real model rollouts always emit ``</think>`` before the answer block,
+    so test fixtures mirror that contract by default. Set
+    ``with_think_close=False`` to specifically exercise the
+    incomplete-generation guard.
+    """
+    if with_think_close:
+        generation = f"<think>reasoning</think>\n{code_block}"
+    else:
+        generation = code_block
     return {
         "input_output": [{"input": "3\n", "output": "3\n"}],
         "starter_code": "",
-        "generation": code_block,
+        "generation": generation,
     }
 
 
@@ -50,3 +63,21 @@ def test_check_coding_correctness_timeout_and_missing_code_return_false():
 
     assert timeout_result is False
     assert no_code_result is False
+
+
+def test_check_coding_correctness_rejects_incomplete_thinking():
+    """Generations missing ``</think>`` must score 0 immediately.
+
+    This is the regression guard for the OOM scenario where a collapsed
+    model emits an unfinished thinking trace until ``MAX_RESPONSE_LENGTH``;
+    AceReason's verifier short-circuits on the missing token instead of
+    trying to compile/run whatever fragment the regex happens to match.
+    """
+    incomplete = get_scores_code.check_coding_correctness(
+        _stdio_problem(
+            "```python\nprint(input())\n```",
+            with_think_close=False,
+        ),
+        timeout=1,
+    )
+    assert incomplete is False
