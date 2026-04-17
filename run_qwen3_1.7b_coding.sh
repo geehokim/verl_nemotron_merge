@@ -75,7 +75,7 @@ TRAIN_BATCH_SIZE=64
 VAL_BATCH_SIZE=128
 # Kept at 32k here for Qwen3-1.7B
 # on this hardware; revisit if scaling up the model or GPU count.
-MAX_RESPONSE_LENGTH=32768
+MAX_RESPONSE_LENGTH=44032
 PPO_MINI_BATCH_SIZE=64
 PPO_MICRO_BATCH_SIZE_PER_GPU=64
 ROLLOUT_N=8
@@ -86,7 +86,7 @@ ROLLOUT_LOGPROB_MICRO_BATCH_SIZE_PER_GPU=16
 # the very first collective (SeqNum=1) timed out at 10 min, taking down
 # the whole cluster.
 ROLLOUT_GPU_MEMORY_UTILIZATION=0.70
-ROLLOUT_MAX_NUM_BATCHED_TOKENS=34816
+ROLLOUT_MAX_NUM_BATCHED_TOKENS=46080
 ULYSSES_SEQUENCE_PARALLEL_SIZE=4
 TEST_FREQ=10
 TRAIN_MAX_SAMPLES=-1
@@ -278,7 +278,7 @@ HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     "${COMMON_ARGS[@]}" \
     actor_rollout_ref.model.path="${BASE_MODEL}" \
     trainer.experiment_name="${EXPERIMENT_NAME}" \
-    +reward_model.reward_kwargs.overlong_filtering=False \
+    +reward_model.reward_kwargs.overlong_filtering=True \
     trainer.total_epochs="${TOTAL_EPOCHS}" \
     trainer.total_training_steps="${TOTAL_TRAINING_STEPS}" \
     trainer.default_local_dir="${OUTPUT_DIR}"

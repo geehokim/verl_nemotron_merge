@@ -359,6 +359,47 @@ def _compute_coding_score(
     ground_truth: Any,
     extra_info: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    # Parse overlong-filtering fields injected by NaiveRewardManager.
+    overlong_filtering = False
+    response_length = 0
+    max_response_length: float = float("inf")
+    if isinstance(extra_info, dict):
+        overlong_filtering = bool(extra_info.get("overlong_filtering", False))
+        try:
+            response_length = int(extra_info.get("response_length", 0) or 0)
+        except (TypeError, ValueError):
+            response_length = 0
+        raw_max = extra_info.get("max_response_length", None)
+        if raw_max is not None:
+            try:
+                max_response_length = int(raw_max)
+            except (TypeError, ValueError):
+                max_response_length = float("inf")
+
+    is_overlong = (
+        response_length >= max_response_length
+        if max_response_length != float("inf")
+        else False
+    )
+
+    # When filtering is on and the rollout was truncated at max_response_length,
+    # short-circuit before running the (expensive) verifier subprocess. The
+    # trainer reads ``skip`` and zeroes out the advantage for this sample, so
+    # truncated trajectories no longer push the policy toward shorter outputs.
+    # Mirrors nemotron_cascade_rl_math.compute_score (Stage 1 overlong filter).
+    if overlong_filtering and is_overlong:
+        return {
+            "score": 0.0,
+            "acc": False,
+            "answer_reward": 0.0,
+            "code_switching": False,
+            "code_switching_penalty": 0.0,
+            "timeout": 0,
+            "num_tests": 0,
+            "skip": True,
+            "overlong": True,
+        }
+
     # Important: we do NOT decode `ground_truth` in this (parent) process.
     # The base64+zlib+pickle expansion of competitive-coding payloads can
     # produce hundreds of MB of small Python objects per sample; doing it
@@ -397,7 +438,9 @@ def _compute_coding_score(
         # batches don't produce object-dtype arrays with None entries in
         # downstream trainer hooks (e.g. the overlong-filter skip_mask).
         "skip": False,
-        "overlong": False,
+        # Expose truncation status even when filtering is off, so dashboards
+        # can track how much of the batch is hitting max_response_length.
+        "overlong": bool(is_overlong),
     }
 
 
