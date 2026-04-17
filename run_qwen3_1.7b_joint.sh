@@ -333,7 +333,7 @@ COMMON_ARGS=(
     +data.multitask_sampler.epoch_policy=largest
     data.dataloader_num_workers=0
 
-    actor_rollout_ref.actor.optim.lr=2e-6
+    actor_rollout_ref.actor.optim.lr=1e-6
     actor_rollout_ref.actor.optim.betas='[0.9,0.95]'
     actor_rollout_ref.model.use_remove_padding=True
     actor_rollout_ref.actor.ppo_mini_batch_size="${PPO_MINI_BATCH_SIZE}"
@@ -415,7 +415,7 @@ COMMON_ARGS=(
 HYDRA_FULL_ERROR=1 python3 -m verl.trainer.main_ppo \
     "${COMMON_ARGS[@]}" \
     actor_rollout_ref.model.path="${BASE_MODEL}" \
-    +reward_model.reward_kwargs.overlong_filtering=False \
+    +reward_model.reward_kwargs.overlong_filtering=True \
     trainer.total_epochs="${TOTAL_EPOCHS}"
 
 log_debug_ram "after_trainer"
